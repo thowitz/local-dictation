@@ -67,7 +67,7 @@ final class MicKeyManager {
     static let hidutilPath = "/usr/bin/hidutil"
 
     private static let log = Logger(
-        subsystem: Bundle.main.bundleIdentifier ?? "local-dictation",
+        subsystem: AppLog.subsystem,
         category: "MicKeyManager"
     )
 

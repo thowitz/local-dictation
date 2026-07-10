@@ -206,5 +206,5 @@ final class TextInserter {
 }
 
 extension AppLog {
-    static let insertion = Logger(subsystem: "com.local-dictation", category: "insertion")
+    static let insertion = Logger(subsystem: AppLog.subsystem, category: "insertion")
 }

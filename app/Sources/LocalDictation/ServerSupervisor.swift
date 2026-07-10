@@ -190,28 +190,26 @@ final class ServerSupervisor {
     private func spawn() throws {
         clearProcess()
 
-        let executable = config.resolvedServerExecutable
-        guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+        let resolution = config.resolveServerLaunchCommand()
+        let command: ServerLaunchCommand
+        switch resolution {
+        case .success(let resolved):
+            command = resolved
+        case .failure(let error):
             throw NSError(
                 domain: "LocalDictation.ServerSupervisor",
                 code: 1,
-                userInfo: [
-                    NSLocalizedDescriptionKey:
-                        "Server executable not found at \(executable.path). Run `uv sync` in server/ or set serverExecutable in config.json.",
-                ]
+                userInfo: [NSLocalizedDescriptionKey: error.description]
             )
         }
 
         let process = Process()
-        process.executableURL = executable
-        var args = [
-            "--port", "\(config.port)",
-            "--parent-pid", "\(ProcessInfo.processInfo.processIdentifier)",
-        ]
-        if let model = config.model, !model.isEmpty {
-            args += ["--model", model]
-        }
-        process.arguments = args
+        process.executableURL = command.executableURL
+        process.arguments = command.processArguments(
+            port: config.port,
+            parentPID: ProcessInfo.processInfo.processIdentifier,
+            model: config.model
+        )
 
         let stdout = Pipe()
         let stderr = Pipe()
@@ -225,7 +223,9 @@ final class ServerSupervisor {
 
         try process.run()
         self.process = process
-        AppLog.server.info("Launched server pid=\(process.processIdentifier)")
+        AppLog.server.info(
+            "Launched server source=\(command.source.rawValue, privacy: .public) pid=\(process.processIdentifier) cmd=\(command.displayCommandLine, privacy: .public)"
+        )
     }
 
     private func attachReader(to pipe: Pipe, isStderr: Bool) {

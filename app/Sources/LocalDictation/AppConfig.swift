@@ -1,11 +1,10 @@
 import Foundation
-import os
 
 /// Application configuration loaded from
 /// `~/Library/Application Support/LocalDictation/config.json`.
 struct AppConfig: Codable, Sendable {
-    /// Absolute path to `local-dictation-serve`. When nil, the compiled-in
-    /// repo-relative default is used.
+    /// Absolute path to a server executable override. When set, resolution treats
+    /// it as authoritative (no fallback on invalid/non-executable paths).
     var serverExecutable: String?
 
     /// WebSocket / health port (default 8471).
@@ -18,10 +17,16 @@ struct AppConfig: Codable, Sendable {
     static let supportDirectoryName = "LocalDictation"
     static let configFileName = "config.json"
 
-    /// Compiled-in fallback: `<repo>/server/.venv/bin/local-dictation-serve`
-    /// where `<repo>` is two levels above the executable when running from
-    /// `.build/.../debug/LocalDictation`, or the hard-coded workspace path.
-    static let compiledInRepoRoot = "/Users/oxxxx/Code/local-dictation"
+    enum ValidationError: Error, Equatable, CustomStringConvertible {
+        case invalidPort(Int)
+
+        var description: String {
+            switch self {
+            case .invalidPort(let value):
+                return "Invalid port \(value); expected an integer in 1...65535."
+            }
+        }
+    }
 
     static var supportDirectoryURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -32,14 +37,48 @@ struct AppConfig: Codable, Sendable {
         supportDirectoryURL.appendingPathComponent(configFileName)
     }
 
+    init(serverExecutable: String? = nil, port: Int = defaultPort, model: String? = nil) {
+        self.serverExecutable = serverExecutable
+        self.port = port
+        self.model = model
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        serverExecutable = try container.decodeIfPresent(String.self, forKey: .serverExecutable)
+        port = try container.decodeIfPresent(Int.self, forKey: .port) ?? Self.defaultPort
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+    }
+
+    /// Decodes JSON and validates port. Unlike `load()`, this surfaces invalid ports
+    /// instead of silently falling back to defaults.
+    static func decode(_ data: Data) throws -> AppConfig {
+        let decoded = try JSONDecoder().decode(AppConfig.self, from: data)
+        try decoded.validate()
+        return decoded
+    }
+
+    func validate() throws {
+        guard (1...65535).contains(port) else {
+            throw ValidationError.invalidPort(port)
+        }
+    }
+
     static func load() -> AppConfig {
         let url = configFileURL
-        if let data = try? Data(contentsOf: url),
-           let decoded = try? JSONDecoder().decode(AppConfig.self, from: data)
-        {
-            return decoded
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path) else {
+            return AppConfig()
         }
-        return AppConfig(serverExecutable: nil, port: defaultPort, model: nil)
+        do {
+            let data = try Data(contentsOf: url)
+            return try decode(data)
+        } catch {
+            AppLog.general.error(
+                "Failed to load config at \(url.path, privacy: .public): \(String(describing: error), privacy: .public); using defaults"
+            )
+            return AppConfig()
+        }
     }
 
     func save() {
@@ -51,13 +90,20 @@ struct AppConfig: Codable, Sendable {
         try? data.write(to: Self.configFileURL, options: .atomic)
     }
 
-    /// Resolved absolute path to the server executable.
-    var resolvedServerExecutable: URL {
-        if let override = serverExecutable, !override.isEmpty {
-            return URL(fileURLWithPath: (override as NSString).expandingTildeInPath)
-        }
-        return URL(fileURLWithPath: Self.compiledInRepoRoot)
-            .appendingPathComponent("server/.venv/bin/local-dictation-serve")
+    /// Production entry point: resolve a launch command using the running executable
+    /// and Application Support directory.
+    func resolveServerLaunchCommand(
+        executableURL: URL = Bundle.main.executableURL
+            ?? URL(fileURLWithPath: CommandLine.arguments[0]),
+        homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser,
+        supportDirectoryURL: URL = AppConfig.supportDirectoryURL
+    ) -> Result<ServerLaunchCommand, ServerLaunchCommandResolver.ResolutionError> {
+        let resolver = ServerLaunchCommandResolver(
+            executableURL: executableURL,
+            homeDirectoryURL: homeDirectoryURL,
+            supportDirectoryURL: supportDirectoryURL
+        )
+        return resolver.resolve(override: serverExecutable)
     }
 
     var healthURL: URL {
@@ -67,11 +113,4 @@ struct AppConfig: Codable, Sendable {
     var websocketURL: URL {
         URL(string: "ws://127.0.0.1:\(port)/v1/realtime")!
     }
-}
-
-enum AppLog {
-    static let general = Logger(subsystem: "com.local-dictation", category: "app")
-    static let server = Logger(subsystem: "com.local-dictation", category: "server")
-    static let realtime = Logger(subsystem: "com.local-dictation", category: "realtime")
-    static let audio = Logger(subsystem: "com.local-dictation", category: "audio")
 }

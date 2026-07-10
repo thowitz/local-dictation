@@ -456,7 +456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         // Restore sound preference before any dictation can start.
-        let defaults = UserDefaults.standard
+        let defaults = AppIdentity.defaults
         if defaults.object(forKey: AppPrefs.playSoundsEnabled) == nil {
             defaults.set(true, forKey: AppPrefs.playSoundsEnabled)
         }
@@ -659,7 +659,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func togglePlaySounds() {
         let enabled = !IndicatorSounds.shared.enabled
         IndicatorSounds.shared.enabled = enabled
-        UserDefaults.standard.set(enabled, forKey: AppPrefs.playSoundsEnabled)
+        AppIdentity.defaults.set(enabled, forKey: AppPrefs.playSoundsEnabled)
         refreshPlaySoundsItem()
     }
 
@@ -718,7 +718,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func runFirstRunChecksIfNeeded() {
-        let defaults = UserDefaults.standard
+        let defaults = AppIdentity.defaults
         guard !defaults.bool(forKey: AppPrefs.firstRunChecksCompleted) else { return }
         defaults.set(true, forKey: AppPrefs.firstRunChecksCompleted)
 
@@ -1062,9 +1062,10 @@ final class CarbonHotKey {
     }
 }
 
-@main
-enum LocalDictationMain {
-    static func main() {
+/// Entry point used by the thin `LocalDictationApp` executable target.
+@MainActor
+public enum LocalDictationBootstrap {
+    public static func run() {
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
