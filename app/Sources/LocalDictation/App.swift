@@ -82,6 +82,7 @@ enum DictationState: Equatable, Sendable {
 private enum AppPrefs {
     static let firstRunChecksCompleted = "firstRunChecksCompleted"
     static let playSoundsEnabled = "playSoundsEnabled"
+    static let micKeyMode = MicKeyMode.preferenceKey
 }
 
 // MARK: - Controller
@@ -175,6 +176,20 @@ final class DictationController {
         default:
             break
         }
+    }
+
+    /// Hold-to-talk down: start only when already ready (running + connected).
+    /// Queuing during warm-up lands in a later slice.
+    func beginHoldDictation() {
+        guard state == .ready else { return }
+        guard case .running = supervisor.state, realtime.isConnected else { return }
+        startDictation()
+    }
+
+    /// Hold-to-talk up: commit/flush only if we are actively listening.
+    func endHoldDictation() {
+        guard state == .listening else { return }
+        stopDictation()
     }
 
     func startDictation() {
@@ -507,6 +522,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var playSoundsItem: NSMenuItem!
     private var installRemapItem: NSMenuItem!
     private var removeRemapItem: NSMenuItem!
+    private var micKeyModeItem: NSMenuItem!
+    private var holdToTalkModeItem: NSMenuItem!
+    private var pressToToggleModeItem: NSMenuItem!
     private var micPermissionItem: NSMenuItem!
     private var axPermissionItem: NSMenuItem!
     private var secureInputItem: NSMenuItem!
@@ -514,6 +532,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var showServerDetailsItem: NSMenuItem!
     private var retryServerItem: NSMenuItem!
     private var statusItemLabel: NSMenuItem!
+
+    /// Interprets F13 press/release according to the latched mic-key mode.
+    private var micKeyInterpreter = MicKeyGestureInterpreter()
 
     /// Dev toggle hotkey: ⌥⌘D (Option+Command+D).
     private let toggleHotKey = CarbonHotKey(
@@ -523,7 +544,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         id: 1
     )
 
-    /// Mic-key path: F13 (after hidutil remap). Same toggle action as ⌥⌘D.
+    /// Mic-key path: F13 (after hidutil remap). Mode-dependent hold or toggle.
     private let f13HotKey = CarbonHotKey(
         keyCode: MicKeyManager.f13KeyCode,
         modifiers: 0,
@@ -550,7 +571,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.controller.toggleDictation()
         }
         toggleHotKey.onPressed = toggleAction
-        f13HotKey.onPressed = toggleAction
+        f13HotKey.onPressed = { [weak self] in
+            self?.handleMicKeyPressed()
+        }
+        f13HotKey.onReleased = { [weak self] in
+            self?.handleMicKeyReleased()
+        }
         toggleHotKey.register()
         f13HotKey.register()
         AppLog.general.info("Hotkeys registered: ⌥⌘D (dev) + F13 (mic-key)")
@@ -614,6 +640,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         removeRemapItem.target = self
         menu.addItem(removeRemapItem)
 
+        let micKeyModeMenu = NSMenu()
+        holdToTalkModeItem = NSMenuItem(
+            title: MicKeyMode.holdToTalk.displayTitle,
+            action: #selector(selectHoldToTalkMode),
+            keyEquivalent: ""
+        )
+        holdToTalkModeItem.target = self
+        micKeyModeMenu.addItem(holdToTalkModeItem)
+
+        pressToToggleModeItem = NSMenuItem(
+            title: MicKeyMode.toggle.displayTitle,
+            action: #selector(selectPressToToggleMode),
+            keyEquivalent: ""
+        )
+        pressToToggleModeItem.target = self
+        micKeyModeMenu.addItem(pressToToggleModeItem)
+
+        micKeyModeItem = NSMenuItem(title: "Mic Key Mode", action: nil, keyEquivalent: "")
+        micKeyModeItem.submenu = micKeyModeMenu
+        menu.addItem(micKeyModeItem)
+
         launchAtLoginItem = NSMenuItem(
             title: "Launch at Login",
             action: #selector(toggleLaunchAtLogin),
@@ -663,6 +710,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshPermissionRows()
         refreshLaunchAtLoginItem()
         refreshPlaySoundsItem()
+        refreshMicKeyModeItems()
         refreshRemapItems()
         refreshUI(for: .idle)
 
@@ -702,11 +750,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 refreshRemapItems()
                 return
             }
+            let mode = MicKeyMode.read(from: AppIdentity.defaults)
+            let micBehavior: String
+            switch mode {
+            case .holdToTalk:
+                micBehavior = "Hold 🎤 to talk (release to stop)."
+            case .toggle:
+                micBehavior = "Press 🎤 to toggle dictation."
+            }
             let alert = NSAlert()
             alert.messageText = "Mic-key remap installed"
             alert.informativeText =
                 "The 🎤 key now sends F13 and will be re-applied at login. "
-                + "Press 🎤 (or ⌥⌘D) to toggle dictation."
+                + micBehavior
+                + " ⌥⌘D remains a toggle shortcut."
             alert.alertStyle = .informational
             alert.addButton(withTitle: "OK")
             alert.runModal()
@@ -759,6 +816,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         IndicatorSounds.shared.enabled = enabled
         AppIdentity.defaults.set(enabled, forKey: AppPrefs.playSoundsEnabled)
         refreshPlaySoundsItem()
+    }
+
+    @objc private func selectHoldToTalkMode() {
+        MicKeyMode.write(.holdToTalk, to: AppIdentity.defaults)
+        refreshMicKeyModeItems()
+    }
+
+    @objc private func selectPressToToggleMode() {
+        MicKeyMode.write(.toggle, to: AppIdentity.defaults)
+        refreshMicKeyModeItems()
+    }
+
+    private func handleMicKeyPressed() {
+        let mode = MicKeyMode.read(from: AppIdentity.defaults)
+        switch micKeyInterpreter.keyDown(mode: mode) {
+        case .beginHold:
+            controller.beginHoldDictation()
+        case .toggle:
+            controller.toggleDictation()
+        case .endHold, .none:
+            break
+        }
+    }
+
+    private func handleMicKeyReleased() {
+        guard micKeyInterpreter.keyUp() == .endHold else { return }
+        controller.endHoldDictation()
     }
 
     @objc private func promptAccessibilityPermission() {
@@ -831,6 +915,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshPermissionRows()
         refreshRemapItems()
         refreshPlaySoundsItem()
+        refreshMicKeyModeItems()
     }
 
     private func presentLaunchAtLoginInstallGuidance() {
@@ -853,6 +938,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quitApp() {
         toggleHotKey.unregister()
         f13HotKey.unregister()
+        micKeyInterpreter.reset()
         controller.cancelDictation()
         NSApp.terminate(nil)
     }
@@ -1067,6 +1153,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         playSoundsItem.state = IndicatorSounds.shared.enabled ? .on : .off
     }
 
+    private func refreshMicKeyModeItems() {
+        let mode = MicKeyMode.read(from: AppIdentity.defaults)
+        holdToTalkModeItem.state = mode == .holdToTalk ? .on : .off
+        pressToToggleModeItem.state = mode == .toggle ? .on : .off
+    }
+
     private func refreshRemapItems() {
         let remapped = micKeyManager.verifyRemap()
         let agent = micKeyManager.isLaunchAgentInstalled()
@@ -1088,11 +1180,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 @MainActor
 final class CarbonHotKey {
     var onPressed: (() -> Void)?
+    var onReleased: (() -> Void)?
 
     private let keyCode: UInt32
     private let modifiers: UInt32
     private let signature: OSType
     private let id: UInt32
+    private var edgeLatch = HotKeyEdgeLatch()
 
     private var hotKeyRef: EventHotKeyRef?
     private var isRegistered = false
@@ -1157,12 +1251,13 @@ final class CarbonHotKey {
             UnregisterEventHotKey(hotKeyRef)
             self.hotKeyRef = nil
         }
+        edgeLatch.reset()
         Self.targets.removeValue(forKey: targetKey)
         isRegistered = false
         Self.tearDownSharedHandlerIfUnused()
     }
 
-    /// Installs one `kEventHotKeyPressed` handler on the application target.
+    /// Installs one shared handler for pressed + released on the application target.
     private static func ensureSharedHandler() -> Bool {
         if sharedHandlerRef != nil { return true }
         if sharedHandlerInstallFailed { return false }
@@ -1171,6 +1266,10 @@ final class CarbonHotKey {
             EventTypeSpec(
                 eventClass: OSType(kEventClassKeyboard),
                 eventKind: UInt32(kEventHotKeyPressed)
+            ),
+            EventTypeSpec(
+                eventClass: OSType(kEventClassKeyboard),
+                eventKind: UInt32(kEventHotKeyReleased)
             ),
         ]
 
@@ -1199,8 +1298,15 @@ final class CarbonHotKey {
                     return OSStatus(eventNotHandledErr)
                 }
 
+                let kind = GetEventKind(eventRef)
                 DispatchQueue.main.async {
-                    target.onPressed?()
+                    if kind == UInt32(kEventHotKeyPressed) {
+                        guard target.edgeLatch.pressed() else { return }
+                        target.onPressed?()
+                    } else if kind == UInt32(kEventHotKeyReleased) {
+                        guard target.edgeLatch.released() else { return }
+                        target.onReleased?()
+                    }
                 }
                 return noErr
             },
