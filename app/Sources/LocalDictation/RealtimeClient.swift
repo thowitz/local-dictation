@@ -15,6 +15,7 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
         var onDone: (@Sendable (String) -> Void)?
         var onConnectionState: (@Sendable (ConnectionState) -> Void)?
         var onError: (@Sendable (String) -> Void)?
+        var onBufferCleared: (@Sendable () -> Void)?
     }
 
     private let endpoint: URL
@@ -78,14 +79,16 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
         sendJSON(payload)
     }
 
-    func commitFinal() {
+    @discardableResult
+    func commitFinal() -> Bool {
         sendJSON([
             "type": "input_audio_buffer.commit",
             "final": true,
         ])
     }
 
-    func clearBuffer() {
+    @discardableResult
+    func clearBuffer() -> Bool {
         sendJSON(["type": "input_audio_buffer.clear"])
     }
 
@@ -166,6 +169,8 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
                 ?? (json["delta"] as? String)
                 ?? ""
             cbs.onDone?(transcript)
+        case "input_audio_buffer.cleared":
+            cbs.onBufferCleared?()
         case "error":
             let message = (json["message"] as? String)
                 ?? (json["error"] as? String)
@@ -176,12 +181,13 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
         }
     }
 
-    private func sendJSON(_ object: [String: Any]) {
+    @discardableResult
+    private func sendJSON(_ object: [String: Any]) -> Bool {
         guard JSONSerialization.isValidJSONObject(object),
               let data = try? JSONSerialization.data(withJSONObject: object),
               let text = String(data: data, encoding: .utf8)
         else {
-            return
+            return false
         }
 
         lock.lock()
@@ -191,7 +197,7 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
 
         guard state == .connected, let currentTask else {
             AppLog.realtime.debug("Dropping frame; not connected")
-            return
+            return false
         }
 
         currentTask.send(.string(text)) { [weak self] error in
@@ -199,6 +205,7 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
                 self?.handleSocketFailure("WebSocket send failed: \(error.localizedDescription)")
             }
         }
+        return true
     }
 
     private func handleSocketFailure(_ message: String) {
