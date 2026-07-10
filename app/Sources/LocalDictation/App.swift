@@ -108,13 +108,13 @@ final class DictationController {
         keyCode: UInt32(kVK_Escape),
         modifiers: 0,
         signature: OSType(0x4C444573), // LDEs
-        id: 1
+        id: 1,
+        requiresReleaseToRearm: false
     )
 
     private var sessionTranscript = ""
     private var intent = DictationIntentTracker()
-    /// Set while waiting for `input_audio_buffer.cleared` after Esc (wired in a later slice).
-    private var awaitingBufferClear = false
+    private var cancellationBarrier = CancellationBarrier()
     private var indicatorActive = false
 
     init(config: AppConfig) {
@@ -155,7 +155,7 @@ final class DictationController {
                         // Don't flip the whole UI to error on transient WS blips while idle/ready.
                         if self?.state == .listening || self?.state == .flushing {
                             self?.intent.clearAll()
-                            self?.awaitingBufferClear = false
+                            self?.cancellationBarrier.reset()
                             self?.endIndicatorSession(playSound: true)
                             self?.transition(to: .failed(.app(message)))
                         }
@@ -209,6 +209,24 @@ final class DictationController {
     }
 
     private func requestStart(intent startIntent: DictationStartIntent) {
+        switch state {
+        case .starting, .downloading, .restarting:
+            // Hold may queue during warm-up without knocking bootstrap into `.failed`.
+            // Secure Input / AX are re-checked at actual capture start in `beginListening`.
+            if startIntent == .micHold {
+                if TextInserter.isSecureEventInputEnabled() || !AXIsProcessTrusted() {
+                    intent.clearAll()
+                    return
+                }
+                intent.queue(.micHold)
+            }
+            return
+        case .listening, .flushing:
+            return
+        case .ready, .idle, .failed:
+            break
+        }
+
         if TextInserter.isSecureEventInputEnabled() {
             intent.clearAll()
             let message = "Secure input is enabled — dictation refused."
@@ -229,14 +247,6 @@ final class DictationController {
         case .ready:
             intent.queue(startIntent)
             beginListeningIfPendingIntent()
-        case .listening, .flushing:
-            return
-        case .starting, .downloading, .restarting:
-            // Hold may queue during warm-up; manual toggle stays a no-op here.
-            if startIntent == .micHold {
-                intent.queue(.micHold)
-            }
-            return
         case .idle, .failed:
             intent.queue(startIntent)
             switch state {
@@ -250,7 +260,8 @@ final class DictationController {
             default:
                 break
             }
-            return
+        default:
+            break
         }
     }
 
@@ -290,10 +301,10 @@ final class DictationController {
         endIndicatorSession(playSound: true)
 
         // Quarantine trailing realtime output until the server acks clear.
-        awaitingBufferClear = true
+        cancellationBarrier.beginCancel()
         if !realtime.clearBuffer() {
             // Clear could not be enqueued — a reconnect owns a fresh session.
-            awaitingBufferClear = false
+            cancellationBarrier.clearEnqueueFailed()
             AppLog.general.info("Dictation cancelled (Esc) — clear enqueue failed, relying on reconnect")
         } else {
             AppLog.general.info("Dictation cancelled (Esc) — awaiting buffer clear")
@@ -309,9 +320,9 @@ final class DictationController {
     // MARK: - Internals
 
     private func beginListening() {
-        guard state == .ready || state == .listening else { return }
-        guard !awaitingBufferClear else { return }
-        guard intent.shouldBeginOnReadiness else { return }
+        guard state == .ready else { return }
+        guard cancellationBarrier.shouldAllowStart(hasPendingIntent: intent.shouldBeginOnReadiness)
+        else { return }
         guard case .running = supervisor.state, realtime.isConnected else { return }
 
         if TextInserter.isSecureEventInputEnabled() {
@@ -356,17 +367,24 @@ final class DictationController {
     }
 
     private func beginListeningIfPendingIntent() {
-        guard !awaitingBufferClear else { return }
-        guard intent.shouldBeginOnReadiness else { return }
+        guard cancellationBarrier.shouldAllowStart(hasPendingIntent: intent.shouldBeginOnReadiness)
+        else { return }
         guard case .running = supervisor.state, realtime.isConnected else { return }
         beginListening()
     }
 
     private func handleBufferCleared() {
-        guard awaitingBufferClear else { return }
-        awaitingBufferClear = false
+        guard cancellationBarrier.bufferCleared() else { return }
         AppLog.general.info("Buffer cleared — barrier open")
         beginListeningIfPendingIntent()
+    }
+
+    private var transcriptSessionPhase: TranscriptSessionPhase {
+        switch state {
+        case .listening: return .listening
+        case .flushing: return .flushing
+        default: return .inactive
+        }
     }
 
     private func showIndicatorListening() {
@@ -392,7 +410,7 @@ final class DictationController {
     /// Retry a terminal server failure without opening the microphone.
     func retryServer() {
         intent.clearAll()
-        awaitingBufferClear = false
+        cancellationBarrier.reset()
         transition(to: .starting)
         supervisor.retry()
     }
@@ -448,7 +466,7 @@ final class DictationController {
         let wasActive = state == .listening || state == .flushing
         guard wasActive else { return }
         intent.interruptActiveSession()
-        awaitingBufferClear = false
+        cancellationBarrier.reset()
         escapeHotKey.unregister()
         audio.stop()
         // discard() keeps already-inserted live text; drops only the uninserted buffer.
@@ -470,7 +488,7 @@ final class DictationController {
         case .connecting:
             break
         case .disconnected:
-            awaitingBufferClear = false
+            cancellationBarrier.reset()
             if state == .listening {
                 intent.interruptActiveSession()
                 escapeHotKey.unregister()
@@ -492,8 +510,7 @@ final class DictationController {
     }
 
     private func handleDelta(_ delta: String) {
-        guard !awaitingBufferClear else { return }
-        guard state == .listening || state == .flushing else { return }
+        guard cancellationBarrier.shouldAcceptTranscript(phase: transcriptSessionPhase) else { return }
         sessionTranscript += delta
         print("[transcript delta] \(delta)")
         AppLog.general.info("delta: \(delta, privacy: .public)")
@@ -502,8 +519,7 @@ final class DictationController {
     }
 
     private func handleDone(_ transcript: String) {
-        guard !awaitingBufferClear else { return }
-        guard state == .listening || state == .flushing else { return }
+        guard cancellationBarrier.shouldAcceptTranscript(phase: transcriptSessionPhase) else { return }
         let finalText = transcript.isEmpty ? sessionTranscript : transcript
         print("[transcript done] \(finalText)")
         AppLog.general.info("done: \(finalText, privacy: .public)")
@@ -605,7 +621,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         keyCode: UInt32(kVK_ANSI_D),
         modifiers: UInt32(cmdKey | optionKey),
         signature: OSType(0x4C444467), // LDDg
-        id: 1
+        id: 1,
+        requiresReleaseToRearm: false
     )
 
     /// Mic-key path: F13 (after hidutil remap). Mode-dependent hold or toggle.
@@ -1250,7 +1267,7 @@ final class CarbonHotKey {
     private let modifiers: UInt32
     private let signature: OSType
     private let id: UInt32
-    private var edgeLatch = HotKeyEdgeLatch()
+    private var edgeLatch: HotKeyEdgeLatch
 
     private var hotKeyRef: EventHotKeyRef?
     private var isRegistered = false
@@ -1265,11 +1282,20 @@ final class CarbonHotKey {
         (UInt64(signature) << 32) | UInt64(id)
     }
 
-    init(keyCode: UInt32, modifiers: UInt32, signature: OSType, id: UInt32) {
+    /// - Parameter requiresReleaseToRearm: F13 hold/toggle needs a paired release. ⌥⌘D and
+    ///   Esc re-arm on a later press if release was dropped (Carbon hotkeys do not key-repeat).
+    init(
+        keyCode: UInt32,
+        modifiers: UInt32,
+        signature: OSType,
+        id: UInt32,
+        requiresReleaseToRearm: Bool = true
+    ) {
         self.keyCode = keyCode
         self.modifiers = modifiers
         self.signature = signature
         self.id = id
+        self.edgeLatch = HotKeyEdgeLatch(requiresReleaseToRearm: requiresReleaseToRearm)
     }
 
     deinit {
