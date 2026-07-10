@@ -94,6 +94,13 @@ struct ServerLaunchCommandResolver: Sendable {
         if let command = resolveBundleHelper(attempted: &attempted) {
             return .success(command)
         }
+
+        // Packaged context: a missing/broken helper is terminal — do not fall through
+        // to Application Support or a nearby development checkout.
+        if contentsDirectory(from: executableURL) != nil {
+            return .failure(.noCandidateFound(attempted: attempted))
+        }
+
         if let command = resolveApplicationSupport(attempted: &attempted) {
             return .success(command)
         }

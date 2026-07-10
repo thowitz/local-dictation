@@ -469,8 +469,34 @@ final class DictationController {
 
 // MARK: - App delegate / menu bar
 
+/// Whether the running binary may register `SMAppService.mainApp`.
+enum AppInstallationContext: Equatable, Sendable {
+    /// Raw SwiftPM / `make run` executable (not inside a `.app`).
+    case rawExecutable
+    /// Packaged `.app` that is not under `/Applications`.
+    case uninstalledBundle
+    /// Packaged `.app` installed under `/Applications`.
+    case installedBundle
+
+    static func current(bundle: Bundle = .main) -> AppInstallationContext {
+        let bundleURL = bundle.bundleURL
+        guard bundleURL.pathExtension == "app" else {
+            return .rawExecutable
+        }
+        let parent = bundleURL.deletingLastPathComponent().standardizedFileURL.path
+        if parent == "/Applications" {
+            return .installedBundle
+        }
+        return .uninstalledBundle
+    }
+
+    var canRegisterLaunchAtLogin: Bool {
+        self == .installedBundle
+    }
+}
+
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var controller: DictationController!
     private var config: AppConfig = .load()
@@ -632,6 +658,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quitItem.target = self
         menu.addItem(quitItem)
 
+        menu.delegate = self
         statusItem.menu = menu
         refreshPermissionRows()
         refreshLaunchAtLoginItem()
@@ -761,24 +788,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleLaunchAtLogin() {
+        let context = AppInstallationContext.current()
+        guard context.canRegisterLaunchAtLogin else {
+            presentLaunchAtLoginInstallGuidance()
+            refreshLaunchAtLoginItem()
+            return
+        }
+
         let service = SMAppService.mainApp
         do {
-            if service.status == .enabled {
+            switch service.status {
+            case .enabled:
                 try service.unregister()
-            } else {
+            case .notRegistered:
                 try service.register()
+            case .requiresApproval:
+                SMAppService.openSystemSettingsLoginItems()
+            case .notFound:
+                presentLaunchAtLoginAlert(
+                    message: "Launch at Login is unavailable",
+                    informative:
+                        "macOS could not find this app’s login-item registration. Reinstall Local Dictation into /Applications, relaunch that copy, and try again."
+                )
+            @unknown default:
+                presentLaunchAtLoginAlert(
+                    message: "Launch at Login",
+                    informative: "Unexpected login-item status. Open System Settings → General → Login Items and check Local Dictation there."
+                )
             }
         } catch {
             AppLog.general.error("Launch at login failed: \(error.localizedDescription, privacy: .public)")
-            let alert = NSAlert()
-            alert.messageText = "Launch at Login"
-            alert.informativeText =
-                "Couldn't update login item: \(error.localizedDescription)\n\nNote: SMAppService.mainApp requires a bundled .app; it may not work when running the raw SPM executable."
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
+            presentLaunchAtLoginAlert(
+                message: "Launch at Login",
+                informative: "Couldn't update login item: \(error.localizedDescription)"
+            )
         }
         refreshLaunchAtLoginItem()
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshLaunchAtLoginItem()
+        refreshPermissionRows()
+        refreshRemapItems()
+        refreshPlaySoundsItem()
+    }
+
+    private func presentLaunchAtLoginInstallGuidance() {
+        presentLaunchAtLoginAlert(
+            message: "Install in /Applications first",
+            informative:
+                "Launch at Login only works from Local Dictation installed under /Applications. Copy LocalDictation.app there, open that copy, then enable Launch at Login."
+        )
+    }
+
+    private func presentLaunchAtLoginAlert(message: String, informative: String) {
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.informativeText = informative
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     @objc private func quitApp() {
@@ -966,8 +1035,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshLaunchAtLoginItem() {
-        let enabled = SMAppService.mainApp.status == .enabled
-        launchAtLoginItem.state = enabled ? .on : .off
+        let context = AppInstallationContext.current()
+        guard context.canRegisterLaunchAtLogin else {
+            launchAtLoginItem.title = "Launch at Login (install in /Applications first)"
+            launchAtLoginItem.state = .off
+            launchAtLoginItem.isEnabled = true
+            return
+        }
+
+        launchAtLoginItem.isEnabled = true
+        switch SMAppService.mainApp.status {
+        case .enabled:
+            launchAtLoginItem.title = "Launch at Login"
+            launchAtLoginItem.state = .on
+        case .notRegistered:
+            launchAtLoginItem.title = "Launch at Login"
+            launchAtLoginItem.state = .off
+        case .requiresApproval:
+            launchAtLoginItem.title = "Launch at Login (approval required…)"
+            launchAtLoginItem.state = .mixed
+        case .notFound:
+            launchAtLoginItem.title = "Launch at Login (unavailable)"
+            launchAtLoginItem.state = .off
+        @unknown default:
+            launchAtLoginItem.title = "Launch at Login"
+            launchAtLoginItem.state = .off
+        }
     }
 
     private func refreshPlaySoundsItem() {

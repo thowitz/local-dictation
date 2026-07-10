@@ -19,20 +19,22 @@ DEV := $(shell xcode-select -p)
 TEST_FW := $(DEV)/Library/Developer/Frameworks
 TEST_LIB := $(DEV)/Library/Developer/usr/lib
 
-.PHONY: server app run model remap unremap smoke test lint clean help
+.PHONY: server app run model remap unremap smoke test lint package package-check clean help
 
 help:
 	@echo "Targets:"
-	@echo "  server  - uv sync Python deps in server/"
-	@echo "  app     - swift build -c release"
-	@echo "  run     - build app if needed, launch (app supervises server)"
-	@echo "  model   - pre-download the default HF model (~3.5 GB)"
-	@echo "  remap   - remap mic key (🎤) → F13 via hidutil"
-	@echo "  unremap - clear UserKeyMapping"
-	@echo "  smoke   - generate test WAV, start server briefly, run ws_smoke"
-	@echo "  test    - Swift tests (app/) + Python unittest (server/tests/)"
-	@echo "  lint    - ruff check + format --check + ty check"
-	@echo "  clean   - remove build artifacts and venv"
+	@echo "  server         - uv sync Python deps in server/"
+	@echo "  app            - swift build -c release"
+	@echo "  run            - build app if needed, launch (app supervises server)"
+	@echo "  model          - pre-download the default HF model (~3.5 GB)"
+	@echo "  remap          - remap mic key (🎤) → F13 via hidutil"
+	@echo "  unremap        - clear UserKeyMapping"
+	@echo "  smoke          - generate test WAV, start server briefly, run ws_smoke"
+	@echo "  test           - Swift tests (app/) + Python unittest (server/tests/)"
+	@echo "  lint           - ruff check + format --check + ty check"
+	@echo "  package        - build signed dist/LocalDictation.app (arm64)"
+	@echo "  package-check  - verify dist/LocalDictation.app layout + bundled server"
+	@echo "  clean          - remove build artifacts, package staging, and venv"
 
 server:
 	cd $(SERVER_DIR) && uv sync --group dev
@@ -129,10 +131,18 @@ lint: server
 	cd $(SERVER_DIR) && uv run ruff format --check src/ scripts/
 	cd $(SERVER_DIR) && uv run ty check src/
 
+package:
+	"$(ROOT)/scripts/package-app.sh"
+
+package-check:
+	"$(ROOT)/scripts/verify-package.sh"
+
 clean:
 	rm -rf $(APP_DIR)/.build
 	rm -rf $(SERVER_DIR)/.venv
 	rm -rf $(SERVER_DIR)/.ruff_cache
+	rm -rf $(ROOT)/.package-build
+	rm -rf $(ROOT)/dist
 	rm -f $(SMOKE_WAV)
 	find $(SERVER_DIR) -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	@echo "Cleaned. Hugging Face model cache left intact."

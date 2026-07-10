@@ -9,7 +9,10 @@ struct ServerSupervisorPolicy: Sendable {
     var readinessPollInterval: Duration
     /// Refreshed by any non-empty output / recognized download progress.
     var inactivityTimeout: Duration
+    /// Absolute startup deadline before any download activity is observed.
     var absoluteStartupCap: Duration
+    /// Absolute startup deadline once download activity has been observed (~2h).
+    var downloadActiveStartupCap: Duration
     var terminationGrace: Duration
     var healthyStabilityWindow: Duration
     var backoffBaseSeconds: Double
@@ -22,6 +25,7 @@ struct ServerSupervisorPolicy: Sendable {
         readinessPollInterval: .milliseconds(400),
         inactivityTimeout: .seconds(600),
         absoluteStartupCap: .seconds(60 * 60),
+        downloadActiveStartupCap: .seconds(2 * 60 * 60),
         terminationGrace: .seconds(2),
         healthyStabilityWindow: .seconds(60),
         backoffBaseSeconds: 0.5,

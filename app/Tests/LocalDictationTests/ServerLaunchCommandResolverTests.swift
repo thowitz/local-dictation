@@ -243,6 +243,98 @@ struct ServerLaunchCommandResolverTests {
         }
     }
 
+    @Test("Bundle path containing spaces resolves helper")
+    func bundlePathContainingSpacesResolvesHelper() throws {
+        try TestSupport.withTemporaryDirectory { root in
+            let appRoot = root.appendingPathComponent("My Apps/Local Dictation.app")
+            let macosExe = appRoot.appendingPathComponent("Contents/MacOS/LocalDictation")
+            try TestSupport.writeFile(at: macosExe, executable: true)
+
+            let helper = appRoot.appendingPathComponent(
+                "Contents/Helpers/LocalDictationServer/bin/python3"
+            )
+            try TestSupport.writeFile(at: helper, executable: true)
+
+            let resolver = makeResolver(
+                executableURL: macosExe,
+                home: root,
+                support: root.appendingPathComponent("Support")
+            )
+            let command = try resolver.resolve(override: nil).get()
+            #expect(command.source == .bundleHelper)
+            #expect(command.executableURL.path == helper.path)
+            #expect(command.argumentPrefix == ServerLaunchCommand.bundleHelperArgumentPrefix)
+        }
+    }
+
+    @Test("Packaged app refuses fall-through when helper is absent")
+    func packagedAppRefusesFallThroughWhenHelperAbsent() throws {
+        try TestSupport.withTemporaryDirectory { root in
+            let appRoot = root.appendingPathComponent("LocalDictation.app")
+            let macosExe = appRoot.appendingPathComponent("Contents/MacOS/LocalDictation")
+            try TestSupport.writeFile(at: macosExe, executable: true)
+
+            // Nearby checkout + Application Support would otherwise win.
+            try plantDevCheckout(at: root.appendingPathComponent("repo"))
+            let supportServe = root
+                .appendingPathComponent("Support/server/bin/local-dictation-serve")
+            try TestSupport.writeFile(at: supportServe, executable: true)
+
+            let resolver = makeResolver(
+                executableURL: macosExe,
+                home: root,
+                support: root.appendingPathComponent("Support")
+            )
+            let result = resolver.resolve(override: nil)
+            guard case .failure(.noCandidateFound(let attempted)) = result else {
+                Issue.record("Expected packaged refusal, got \(result)")
+                return
+            }
+            #expect(attempted.count == 1)
+            #expect(attempted[0].source == .bundleHelper)
+            #expect(attempted[0].status == .missing)
+            #expect(
+                attempted[0].url.path.hasSuffix(
+                    "Contents/Helpers/LocalDictationServer/bin/python3"
+                )
+            )
+        }
+    }
+
+    @Test("Successful relocation of a bundle still resolves helper")
+    func successfulRelocationOfBundleResolvesHelper() throws {
+        try TestSupport.withTemporaryDirectory { root in
+            let original = root.appendingPathComponent("Original/LocalDictation.app")
+            let macosExe = original.appendingPathComponent("Contents/MacOS/LocalDictation")
+            try TestSupport.writeFile(at: macosExe, executable: true)
+            let helper = original.appendingPathComponent(
+                "Contents/Helpers/LocalDictationServer/bin/python3"
+            )
+            try TestSupport.writeFile(at: helper, executable: true)
+
+            let relocated = root.appendingPathComponent("Moved Elsewhere/LocalDictation.app")
+            try FileManager.default.createDirectory(
+                at: relocated.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try FileManager.default.copyItem(at: original, to: relocated)
+
+            let relocatedExe = relocated.appendingPathComponent("Contents/MacOS/LocalDictation")
+            let relocatedHelper = relocated.appendingPathComponent(
+                "Contents/Helpers/LocalDictationServer/bin/python3"
+            )
+            let resolver = makeResolver(
+                executableURL: relocatedExe,
+                home: root,
+                support: root.appendingPathComponent("Support")
+            )
+            let command = try resolver.resolve(override: nil).get()
+            #expect(command.source == .bundleHelper)
+            #expect(command.executableURL.path == relocatedHelper.path)
+            #expect(command.argumentPrefix == ServerLaunchCommand.bundleHelperArgumentPrefix)
+        }
+    }
+
     @Test("Application Support order is deterministic")
     func applicationSupportOrderIsDeterministic() throws {
         try TestSupport.withTemporaryDirectory { root in

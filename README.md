@@ -6,21 +6,53 @@ Two processes, one repo: a Python WebSocket ASR server (`server/`) and a menu-ba
 
 ## Requirements
 
-- Apple Silicon Mac
+### Build (development / packaging)
+
+- Apple Silicon Mac (arm64)
 - macOS 15 or later
 - [uv](https://docs.astral.sh/uv/) (Python package manager)
 - Xcode Command Line Tools (`xcode-select --install`) — Swift 6 toolchain
 
-## Quick start
+### Packaged runtime (installed `.app`)
+
+- Apple Silicon Mac, macOS 15+
+- Network and roughly **4 GB free** for the first model download (or pre-seed with `make model` on a build machine that shares the same HF cache)
+- **No** Python, uv, or Xcode required on the end-user machine
+
+## Quick start (development)
 
 ```bash
 make server   # uv sync (incl. dev tools) in server/
 make model    # pre-download ~3.5 GB HF model (optional but recommended)
 make app      # swift build -c release
-make run      # launch the menu-bar app
+make run      # launch the menu-bar app (raw SwiftPM product)
 ```
 
-On launch the app **resolves** a server launch command (see [Server launch command](#server-launch-command) below). In a development checkout that is typically `server/.venv/bin/local-dictation-serve` (default port **8471**, model `mlx-community/Voxtral-Mini-4B-Realtime-6bit`). You do not need to run the server in a separate terminal for normal use.
+This development path intentionally uses the repo venv (`server/.venv/bin/local-dictation-serve`). On launch the app **resolves** a server launch command (see [Server launch command](#server-launch-command) below). You do not need to run the server in a separate terminal for normal use.
+
+## Packaged app (`make package`)
+
+Build a Finder-launchable, ad-hoc–signed app that embeds a relocatable CPython + MLX server runtime:
+
+```bash
+make package         # → dist/LocalDictation.app
+make package-check   # layout, signatures, bundled `python3 -m … --help`
+```
+
+### Install
+
+```bash
+# Finder: drag dist/LocalDictation.app into /Applications
+# or:
+ditto dist/LocalDictation.app /Applications/LocalDictation.app
+open /Applications/LocalDictation.app
+```
+
+Grant **Microphone**, **Accessibility**, and **Input Monitoring** to the **installed** `/Applications/LocalDictation.app` (not the raw `make run` binary). TCC grants are signature/path-specific; preferences share the `com.omcdowell.LocalDictation` defaults suite across raw and packaged runs.
+
+**Launch at Login** is offered only from the installed `/Applications` copy and may require approval under **System Settings → General → Login Items**. Raw `make run` builds and uninstalled bundles show “install in /Applications first”.
+
+The package is **arm64** and **ad-hoc signed**, not notarized. A quarantined copy transferred to another Mac may need the normal **right-click → Open** / Open Anyway flow. Do not disable Gatekeeper globally.
 
 Install the mic-key remap from the app menu (**Install mic-key remap…**), or manually:
 
@@ -69,7 +101,7 @@ The app does **not** hard-code a repo path. At each start/retry it resolves a `S
    <LocalDictation.app>/Contents/Helpers/LocalDictationServer/bin/python3 \
      -I -B -u -m local_dictation_server.server
    ```
-   Issue **#4 only recognizes this layout**; `make package` / issue **#5** actually creates it.
+   `make package` installs this helper. A packaged app with a missing/broken helper **does not** fall through to Application Support or a nearby checkout.
 3. **Application Support** — `~/Library/Application Support/LocalDictation/server/bin/local-dictation-serve`, then `…/server/.venv/bin/local-dictation-serve`.
 4. **Development checkout** — walk ancestors from the running executable for a repo root that contains both `server/` and `app/`, then use `server/.venv/bin/local-dictation-serve`.
 
@@ -99,9 +131,11 @@ Port-in-use, launch failure, readiness timeout, and repeated exits each show a c
 
 ### First-download behavior
 
-Startup is **activity-aware**: ongoing model-download (or other) output keeps readiness waiting alive. Prolonged silence (or an absolute startup cap) times out with details that say which deadline fired. **`/health` HTTP 200 is the sole readiness signal** — stdout markers are diagnostic only.
+On first launch (empty Hugging Face cache), the supervised server downloads the default model (~3.5 GB) into `~/.cache/huggingface` (shared with `make model`, raw runs, and packaged runs — no `HF_HOME` override). Interrupted downloads resume from that cache.
 
-Prefer `make model` beforehand on a good network so the first supervised start does not download ~3.5 GB cold.
+Startup is **activity-aware**: before any download output, readiness fails after **10 minutes** of silence or a **1 hour** absolute cap. Once download progress is observed, the absolute window extends to **~2 hours**, but **10 minutes** without output still fails (reported as a stalled-download timeout when the extended cap fires). **`/health` HTTP 200 is the sole readiness signal** — stdout markers are diagnostic only.
+
+Prefer `make model` beforehand on a good network so the first supervised start does not download cold.
 
 ## Makefile targets
 
@@ -111,11 +145,13 @@ Prefer `make model` beforehand on a good network so the first supervised start d
 | `make app` | `swift build -c release` in `app/` |
 | `make run` | Build if needed, launch `LocalDictation` (app supervises server) |
 | `make model` | Pre-download the default Hugging Face model |
+| `make package` | Build signed `dist/LocalDictation.app` (arm64, embedded Python/MLX) |
+| `make package-check` | Verify package layout, signatures, and bundled server `--help` |
 | `make remap` / `make unremap` | Direct `hidutil` UserKeyMapping set/clear |
 | `make smoke` | Generate test WAV, briefly start server, run `ws_smoke.py` |
 | `make test` | Swift tests in `app/` + Python `unittest` in `server/tests/` |
 | `make lint` | `ruff check`, `ruff format --check`, `ty check` |
-| `make clean` | Remove `.build`, `.venv`, caches (not the HF model cache) |
+| `make clean` | Remove `.build`, `.venv`, `.package-build/`, `dist/`, caches (not the HF model cache) |
 
 ### Testing
 

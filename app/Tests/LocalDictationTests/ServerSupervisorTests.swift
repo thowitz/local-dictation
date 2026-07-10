@@ -122,6 +122,7 @@ struct ServerSupervisorTests {
         var policy = ServerSupervisorPolicy.test
         policy.inactivityTimeout = .milliseconds(100)
         policy.absoluteStartupCap = .seconds(30)
+        policy.downloadActiveStartupCap = .seconds(60)
         policy.readinessPollInterval = .milliseconds(20)
         let h = SupervisorHarness(policy: policy, scripts: scripts)
         h.healthOK = false
@@ -143,12 +144,13 @@ struct ServerSupervisorTests {
         #expect(h.states.contains { if case .downloading = $0 { return true }; return false })
         #expect(!h.states.contains(.running), "health remains the only ready transition")
 
-        // Stop emitting; inactivity should fire (not absolute).
+        // Stop emitting; inactivity should fire (not absolute / stalled download).
         await h.waitUntil {
             self.failures(h).contains { $0.kind == .readinessTimedOut }
         }
         #expect(failures(h)[0].underlyingMessage?.contains("inactivity") == true)
         #expect(failures(h)[0].underlyingMessage?.contains("absoluteCap") != true)
+        #expect(failures(h)[0].underlyingMessage?.contains("stalledDownload") != true)
     }
 
     @Test("absolute cap ends noisy-but-unhealthy command despite continuous output")
@@ -161,8 +163,10 @@ struct ServerSupervisorTests {
             )
         ]
         var policy = ServerSupervisorPolicy.test
+        // No download activity — ordinary absolute cap applies.
         policy.inactivityTimeout = .milliseconds(500)
         policy.absoluteStartupCap = .milliseconds(200)
+        policy.downloadActiveStartupCap = .seconds(30)
         policy.readinessPollInterval = .milliseconds(20)
         let h = SupervisorHarness(policy: policy, scripts: scripts)
         h.healthOK = false
@@ -170,7 +174,8 @@ struct ServerSupervisorTests {
         await h.waitUntil { h.factory.created.first != nil }
 
         for _ in 0..<12 {
-            h.factory.created.first?.emitStderr("downloading: 50%| 1MB/s | 5s left\n")
+            // Non-download noise keeps inactivity alive but does not extend the cap.
+            h.factory.created.first?.emitStderr("still loading weights…\n")
             await h.pump(advance: .milliseconds(30), times: 2)
             if failures(h).contains(where: { $0.kind == .readinessTimedOut }) {
                 break
@@ -181,6 +186,54 @@ struct ServerSupervisorTests {
             self.failures(h).contains { $0.kind == .readinessTimedOut }
         }
         #expect(failures(h)[0].underlyingMessage?.contains("absoluteCap") == true)
+        #expect(failures(h)[0].underlyingMessage?.contains("stalledDownload") != true)
+    }
+
+    @Test("download activity extends absolute window up to downloadActiveStartupCap")
+    func downloadActivityExtendsAbsoluteWindow() async {
+        let scripts = [
+            FakeManagedProcess.Script(
+                exitAfterLaunch: nil,
+                emitOnLaunch: false,
+                holdExit: true
+            )
+        ]
+        var policy = ServerSupervisorPolicy.test
+        policy.inactivityTimeout = .milliseconds(500)
+        policy.absoluteStartupCap = .milliseconds(120)
+        policy.downloadActiveStartupCap = .milliseconds(400)
+        policy.readinessPollInterval = .milliseconds(20)
+        let h = SupervisorHarness(policy: policy, scripts: scripts)
+        h.healthOK = false
+        h.start()
+        await h.waitUntil { h.factory.created.first != nil }
+
+        // Past the ordinary absolute cap, but download progress keeps us alive.
+        for i in 0..<6 {
+            h.factory.created.first?.emitStderr(
+                "downloading: \(i * 10)%| 1MB/s | 5s left\n"
+            )
+            await h.pump(advance: .milliseconds(40), times: 1)
+            #expect(
+                failures(h).isEmpty,
+                "download-active window should survive past absoluteStartupCap (i=\(i))"
+            )
+        }
+
+        // Keep emitting until the download-active cap fires.
+        for _ in 0..<20 {
+            h.factory.created.first?.emitStderr("downloading: 90%| 1MB/s | 1s left\n")
+            await h.pump(advance: .milliseconds(40), times: 1)
+            if failures(h).contains(where: { $0.kind == .readinessTimedOut }) {
+                break
+            }
+        }
+
+        await h.waitUntil {
+            self.failures(h).contains { $0.kind == .readinessTimedOut }
+        }
+        #expect(failures(h)[0].underlyingMessage?.contains("stalledDownload") == true)
+        #expect(failures(h)[0].underlyingMessage?.contains("absoluteCap") != true)
     }
 
     // MARK: - Port preflight / sentinel

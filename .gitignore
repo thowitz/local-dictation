@@ -23,3 +23,10 @@ server/test.wav
 
 # Hugging Face / model caches (never commit)
 .cache/
+
+# Packaging (generated; keep app/Resources/AppIcon.svg + Info.plist tracked)
+/.package-build/
+/dist/
+*.iconset/
+*.icns
+!app/Resources/AppIcon.svg

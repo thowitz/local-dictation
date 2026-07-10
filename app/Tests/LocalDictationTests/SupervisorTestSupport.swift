@@ -404,6 +404,7 @@ extension ServerSupervisorPolicy {
         readinessPollInterval: .milliseconds(10),
         inactivityTimeout: .milliseconds(100),
         absoluteStartupCap: .milliseconds(500),
+        downloadActiveStartupCap: .milliseconds(2000),
         terminationGrace: .milliseconds(10),
         healthyStabilityWindow: .milliseconds(200),
         backoffBaseSeconds: 0.01,

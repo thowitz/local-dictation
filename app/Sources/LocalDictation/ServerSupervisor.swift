@@ -19,6 +19,8 @@ final class ServerSupervisor {
     enum TimeoutKind: Equatable, Sendable {
         case inactivity
         case absoluteCap
+        /// Absolute download-active cap reached (download activity was observed).
+        case stalledDownload
     }
 
     /// Injectable seams for deterministic tests.
@@ -297,6 +299,8 @@ final class ServerSupervisor {
                     message = "Server readiness timed out: no output/health for \(formatDuration(policy.inactivityTimeout))."
                 case .absoluteCap:
                     message = "Server readiness timed out: absolute startup cap \(formatDuration(policy.absoluteStartupCap)) reached."
+                case .stalledDownload:
+                    message = "Server readiness timed out: download-active startup cap \(formatDuration(policy.downloadActiveStartupCap)) reached (stalled download)."
                 }
                 transition(to: .failed(makeFailure(
                     kind: .readinessTimedOut,
@@ -365,8 +369,12 @@ final class ServerSupervisor {
                 lastActivity = activityAt
             }
 
-            if now.timeIntervalSince(started) >= durationSeconds(policy.absoluteStartupCap) {
-                return .timedOut(.absoluteCap)
+            let downloadActive = activity.hasDownloadActivity
+            let absoluteCap = downloadActive
+                ? policy.downloadActiveStartupCap
+                : policy.absoluteStartupCap
+            if now.timeIntervalSince(started) >= durationSeconds(absoluteCap) {
+                return .timedOut(downloadActive ? .stalledDownload : .absoluteCap)
             }
             if now.timeIntervalSince(lastActivity) >= durationSeconds(policy.inactivityTimeout) {
                 return .timedOut(.inactivity)
@@ -680,6 +688,8 @@ final class ServerSupervisor {
                 suffix = "timeoutReason: inactivity"
             case .absoluteCap:
                 suffix = "timeoutReason: absoluteCap"
+            case .stalledDownload:
+                suffix = "timeoutReason: stalledDownload"
             }
             if let existing = msg {
                 msg = existing + " (\(suffix))"
