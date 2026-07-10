@@ -291,6 +291,9 @@ final class FakeManagedProcess: ManagedProcess {
 final class SupervisorHarnessControls {
     var healthOK = false
     var portResult: PortProbeResult = .available
+    /// Fake on-disk `*.incomplete` byte count returned by the download-liveness
+    /// seam. `nil` (default) means no partial download — most tests leave it so.
+    var downloadInFlightBytes: Int?
     var resolveResult: Result<ServerLaunchCommand, ServerLaunchCommandResolver.ResolutionError>
     let clock: FakeClock
     let factory: FakeManagedProcess.Factory
@@ -321,6 +324,10 @@ final class SupervisorHarness {
     var portResult: PortProbeResult {
         get { controls.portResult }
         set { controls.portResult = newValue }
+    }
+    var downloadInFlightBytes: Int? {
+        get { controls.downloadInFlightBytes }
+        set { controls.downloadInFlightBytes = newValue }
     }
     var resolveResult: Result<ServerLaunchCommand, ServerLaunchCommandResolver.ResolutionError> {
         get { controls.resolveResult }
@@ -357,7 +364,8 @@ final class SupervisorHarness {
             sleep: { duration in
                 try await controls.clock.sleep(duration)
             },
-            now: { controls.clock.current() }
+            now: { controls.clock.current() },
+            downloadInFlightByteCount: { controls.downloadInFlightBytes }
         )
 
         self.supervisor = ServerSupervisor(config: config, policy: policy, dependencies: deps)

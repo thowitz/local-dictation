@@ -31,6 +31,12 @@ final class ServerSupervisor {
         var makeProcess: ManagedProcessFactory
         var sleep: (Duration) async throws -> Void
         var now: () -> Date
+        /// Total bytes of Hugging Face `*.incomplete` partial-download blobs on
+        /// disk, or `nil` when none/unavailable. A *rising* value is disk-backed
+        /// download liveness: piped tqdm/HF stays silent for minutes on a large
+        /// safetensors shard, so output alone cannot tell a live download from a
+        /// hung one — the growing blob can. Sampled every readiness poll.
+        var downloadInFlightByteCount: () -> Int?
 
         static func production() -> Dependencies {
             Dependencies(
@@ -49,7 +55,8 @@ final class ServerSupervisor {
                 portProbe: { host, port in PortProbe.bind(host: host, port: port) },
                 makeProcess: { url, args in FoundationManagedProcess(executableURL: url, arguments: args) },
                 sleep: { duration in try await Task.sleep(for: duration) },
-                now: { Date() }
+                now: { Date() },
+                downloadInFlightByteCount: { HuggingFaceCacheProbe.inFlightIncompleteByteCount() }
             )
         }
     }
@@ -353,6 +360,9 @@ final class ServerSupervisor {
     private func waitForReadiness(generation attemptGeneration: UInt64) async -> ReadinessOutcome {
         let started = deps.now()
         var lastActivity = started
+        // Last on-disk `*.incomplete` byte count; only a strict increase counts as
+        // liveness (see below). `nil` until the first successful sample.
+        var previousDownloadBytes: Int?
 
         while isCurrent(attemptGeneration) && !stoppingIntentionally && !Task.isCancelled {
             if managed?.isRunning != true {
@@ -367,6 +377,25 @@ final class ServerSupervisor {
             let now = deps.now()
             if let activityAt = activity.lastOutputAt, activityAt > lastActivity {
                 lastActivity = activityAt
+            }
+
+            // Disk-backed liveness: a live model download advances its `*.incomplete`
+            // blob on disk even when piped tqdm/HF emits nothing for minutes. A
+            // *rising* byte count refreshes the inactivity timer and marks the attempt
+            // download-active (the longer cap applies); a flat count (true stall)
+            // does neither, so a genuinely hung download still times out.
+            if let bytes = deps.downloadInFlightByteCount() {
+                if let previous = previousDownloadBytes, bytes > previous {
+                    lastActivity = now
+                    activity.lastDownloadProgressAt = now
+                    switch state {
+                    case .launching, .waitingForReady, .downloading:
+                        transition(to: .downloading(percent: downloadPercent))
+                    default:
+                        break
+                    }
+                }
+                previousDownloadBytes = bytes
             }
 
             let downloadActive = activity.hasDownloadActivity
@@ -748,4 +777,78 @@ final class ServerSupervisor {
 private struct SpawnLaunchError: Error {
     let underlying: Error
     let command: ServerLaunchCommand
+}
+
+/// Best-effort read of the Hugging Face hub cache for an in-flight download.
+///
+/// `snapshot_download` streams each blob into a `<hub>/models--*/blobs/<sha>.incomplete`
+/// sidecar and renames it on completion, so the summed size of those files rises
+/// monotonically while bytes land — even when piped tqdm/HF output goes quiet on a
+/// large safetensors shard. The readiness watchdog treats a *rising* count as
+/// liveness. This never fabricates liveness: any absence or error yields `nil`.
+private enum HuggingFaceCacheProbe {
+    /// Total bytes of all `*.incomplete` blobs in the hub cache, or `nil` when the
+    /// cache is missing, unreadable, or holds no partial download. Kept cheap for
+    /// the ~400 ms readiness poll: scan only each repo's `blobs` dir (there are
+    /// ~0–1 `*.incomplete` files at a time), never the whole cache tree.
+    static func inFlightIncompleteByteCount() -> Int? {
+        guard let hub = hubCacheURL() else { return nil }
+        let fm = FileManager.default
+        guard let repos = try? fm.contentsOfDirectory(
+            at: hub,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        var total = 0
+        var sawIncomplete = false
+        for repo in repos {
+            let blobs = repo.appendingPathComponent("blobs", isDirectory: true)
+            guard let entries = try? fm.contentsOfDirectory(
+                at: blobs,
+                includingPropertiesForKeys: [.fileSizeKey],
+                options: [.skipsHiddenFiles]
+            ) else {
+                continue
+            }
+            for entry in entries where entry.pathExtension == "incomplete" {
+                sawIncomplete = true
+                let size = (try? entry.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+                total += size
+            }
+        }
+        return sawIncomplete ? total : nil
+    }
+
+    /// Resolve the hub cache dir the way `huggingface_hub` does, honoring env
+    /// overrides in precedence order: `HF_HUB_CACHE`, else `HF_HOME`/hub, else
+    /// `XDG_CACHE_HOME`/huggingface/hub, else `~/.cache/huggingface/hub`. The
+    /// child inherits our environment, so reading it here matches the child's cache.
+    static func hubCacheURL() -> URL? {
+        let env = ProcessInfo.processInfo.environment
+        func value(_ key: String) -> String? {
+            guard let raw = env[key]?.trimmingCharacters(in: .whitespaces),
+                  !raw.isEmpty else { return nil }
+            return raw
+        }
+
+        if let hubCache = value("HF_HUB_CACHE") {
+            return URL(fileURLWithPath: hubCache, isDirectory: true)
+        }
+        if let hfHome = value("HF_HOME") {
+            return URL(fileURLWithPath: hfHome, isDirectory: true)
+                .appendingPathComponent("hub", isDirectory: true)
+        }
+        if let xdg = value("XDG_CACHE_HOME") {
+            return URL(fileURLWithPath: xdg, isDirectory: true)
+                .appendingPathComponent("huggingface", isDirectory: true)
+                .appendingPathComponent("hub", isDirectory: true)
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cache", isDirectory: true)
+            .appendingPathComponent("huggingface", isDirectory: true)
+            .appendingPathComponent("hub", isDirectory: true)
+    }
 }

@@ -236,6 +236,83 @@ struct ServerSupervisorTests {
         #expect(failures(h)[0].underlyingMessage?.contains("absoluteCap") != true)
     }
 
+    // MARK: - Download-aware liveness (disk progress)
+
+    @Test("silent-but-live download (disk bytes rising, no output) is not killed")
+    func silentDiskDownloadSurvivesInactivity() async {
+        let scripts = [
+            FakeManagedProcess.Script(
+                exitAfterLaunch: nil,
+                emitOnLaunch: false,
+                holdExit: true
+            )
+        ]
+        var policy = ServerSupervisorPolicy.test
+        // Tight inactivity window; generous caps so only disk progress can keep
+        // this alive (no stdout/stderr ever arrives).
+        policy.inactivityTimeout = .milliseconds(100)
+        policy.absoluteStartupCap = .seconds(30)
+        policy.downloadActiveStartupCap = .seconds(60)
+        policy.readinessPollInterval = .milliseconds(20)
+        let h = SupervisorHarness(policy: policy, scripts: scripts)
+        h.healthOK = false
+        h.start()
+        await h.waitUntil { h.factory.created.first != nil }
+
+        // No output at all. The `*.incomplete` blob grows every poll across a span
+        // (20 × 20ms = 400ms) far beyond inactivityTimeout (100ms): rising disk
+        // bytes must refresh liveness so the download is never killed.
+        var bytes = 0
+        for _ in 0..<20 {
+            bytes += 1_000_000
+            h.downloadInFlightBytes = bytes
+            await h.pump(advance: .milliseconds(20), times: 1)
+            #expect(
+                failures(h).isEmpty,
+                "rising on-disk download bytes must refresh inactivity liveness"
+            )
+        }
+
+        // Treated as download-active (disk progress surfaces as .downloading), and
+        // health never returned 200 so it never falsely became running.
+        #expect(h.states.contains { if case .downloading = $0 { return true }; return false })
+        #expect(!h.states.contains(.running))
+        #expect(failures(h).isEmpty)
+    }
+
+    @Test("stalled download (disk bytes flat, no output) still times out")
+    func flatDiskDownloadTimesOut() async {
+        let scripts = [
+            FakeManagedProcess.Script(
+                exitAfterLaunch: nil,
+                emitOnLaunch: false,
+                holdExit: true
+            )
+        ]
+        var policy = ServerSupervisorPolicy.test
+        policy.inactivityTimeout = .milliseconds(80)
+        policy.absoluteStartupCap = .seconds(30)
+        policy.downloadActiveStartupCap = .seconds(60)
+        policy.readinessPollInterval = .milliseconds(20)
+        let h = SupervisorHarness(policy: policy, scripts: scripts)
+        h.healthOK = false
+        // A partial blob is present but frozen — the size never advances.
+        h.downloadInFlightBytes = 2_600_000_000
+        h.start()
+
+        await h.waitUntil {
+            self.failures(h).contains { $0.kind == .readinessTimedOut }
+        }
+
+        let failure = failures(h)[0]
+        #expect(failure.kind == .readinessTimedOut)
+        // A flat byte count is not progress: it never marks download-active, so
+        // this falls through to inactivity exactly as a silent stall does today.
+        #expect(failure.underlyingMessage?.contains("inactivity") == true)
+        #expect(!h.states.contains { if case .downloading = $0 { return true }; return false })
+        #expect(h.factory.created.first?.isRunning == false)
+    }
+
     // MARK: - Port preflight / sentinel
 
     @Test("port preflight inUse fails before any process creation")
