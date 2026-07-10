@@ -1,6 +1,6 @@
 # local-dictation
 
-Native, fully local dictation for macOS — a drop-in replacement for system Dictation. Press the 🎤 mic key to start/stop; words stream into the focused app while you speak. Powered by **Voxtral-Mini-4B-Realtime** (6-bit MLX) via [voxmlx](https://github.com/awni/voxmlx) on Apple Silicon.
+Native, fully local dictation for macOS — a drop-in replacement for system Dictation. Use the 🎤 mic key in **Hold to Talk** or **Press to Toggle** mode (menu: Mic Key Mode); words stream into the focused app while you speak. Powered by **Voxtral-Mini-4B-Realtime** (6-bit MLX) via [voxmlx](https://github.com/awni/voxmlx) on Apple Silicon.
 
 Two processes, one repo: a Python WebSocket ASR server (`server/`) and a menu-bar Swift app (`app/`) that captures audio, inserts text, and supervises the server.
 
@@ -82,10 +82,11 @@ Otherwise macOS will steal the mic key:
 
 ## Usage
 
-- Press **🎤** (after remap) to start dictation — a blue mic indicator appears at the caret.
-- Press **🎤** again to stop — trailing tokens flush, then the indicator dismisses.
+- **Hold to Talk** (Mic Key Mode): hold **🎤** to dictate — a blue mic indicator appears at the caret; release to stop and flush trailing tokens.
+- **Press to Toggle** (default): press **🎤** to start; press again to stop and flush.
+- **⌥⌘D** and the menu Start/Stop item always toggle, regardless of mic-key mode.
 - Press **Esc** while active to cancel immediately (already-typed text stays; in terminal buffer mode the buffer is discarded).
-- Menu bar: Start/Stop, remap install, Launch at Login, permission status, Quit.
+- Menu bar: Start/Stop, Mic Key Mode, remap install, Launch at Login, permission status, Quit.
 
 ### Terminal mode
 

@@ -4,8 +4,8 @@ import os
 // MARK: - Public API (wired from App.swift)
 //
 // `MicKeyManager` owns the 🎤 → F13 hidutil remap and LaunchAgent persistence.
-// Carbon hotkeys (F13 toggle, Esc cancel, ⌥⌘D) live in App.swift's `CarbonHotKey`
-// helper — one registration mechanism for the whole app.
+// Carbon hotkeys (F13 hold/toggle per Mic Key Mode, Esc cancel, ⌥⌘D toggle) live in
+// App.swift's `CarbonHotKey` helper — one registration mechanism for the whole app.
 //
 //   let mic = MicKeyManager()
 //   switch mic.installRemap() {
