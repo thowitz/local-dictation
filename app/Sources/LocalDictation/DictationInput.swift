@@ -145,16 +145,87 @@ struct DictationIntentTracker: Equatable, Sendable {
     }
 }
 
+// MARK: - Cancellation / transcript barrier
+
+/// Phase of an active dictation session for transcript gating.
+enum TranscriptSessionPhase: Equatable, Sendable {
+    case inactive
+    case listening
+    case flushing
+}
+
+/// Pure Esc-cancellation barrier: quarantine deltas/done until `input_audio_buffer.cleared`,
+/// and block pending starts while awaiting that acknowledgement.
+struct CancellationBarrier: Equatable, Sendable {
+    private(set) var awaitingBufferClear = false
+
+    var isAwaitingClear: Bool { awaitingBufferClear }
+
+    /// Accept transcript only in `.listening`/`.flushing` while the barrier is open.
+    func shouldAcceptTranscript(phase: TranscriptSessionPhase) -> Bool {
+        switch phase {
+        case .listening, .flushing:
+            return !awaitingBufferClear
+        case .inactive:
+            return false
+        }
+    }
+
+    /// Whether a pending start may begin (barrier must be open).
+    func shouldAllowStart(hasPendingIntent: Bool) -> Bool {
+        hasPendingIntent && !awaitingBufferClear
+    }
+
+    /// Esc cancel: close the barrier until the server acks clear.
+    mutating func beginCancel() {
+        awaitingBufferClear = true
+    }
+
+    /// Clear frame could not be enqueued — open immediately (reconnect owns a fresh session).
+    mutating func clearEnqueueFailed() {
+        awaitingBufferClear = false
+    }
+
+    /// Server ack: open the barrier. Returns `true` only if we were awaiting.
+    @discardableResult
+    mutating func bufferCleared() -> Bool {
+        guard awaitingBufferClear else { return false }
+        awaitingBufferClear = false
+        return true
+    }
+
+    /// Disconnect / interrupt / hard failure — drop any outstanding wait.
+    mutating func reset() {
+        awaitingBufferClear = false
+    }
+}
+
 // MARK: - Hot-key edge latch
 
 /// Pure per-instance edge/repeat suppression for Carbon hotkeys.
-/// Delivers only the first pressed while down and only the matching release.
+///
+/// - `requiresReleaseToRearm: true` (F13): deliver only the first press while down; matching
+///   release re-arms. Missed release sticks until `reset()`.
+/// - `requiresReleaseToRearm: false` (⌥⌘D / Esc): suppress true key-repeat while down, but a
+///   later press after a dropped release still delivers (Carbon hotkeys do not key-repeat).
 struct HotKeyEdgeLatch: Equatable, Sendable {
+    /// When `true`, a press while already down is ignored until `released()` or `reset()`.
+    var requiresReleaseToRearm: Bool
     private var isDown = false
 
-    /// Returns `true` only for the first pressed event of a down cycle.
+    init(requiresReleaseToRearm: Bool = true) {
+        self.requiresReleaseToRearm = requiresReleaseToRearm
+    }
+
+    /// Returns `true` when the press should be delivered to the app.
     mutating func pressed() -> Bool {
-        guard !isDown else { return false }
+        if isDown {
+            if requiresReleaseToRearm {
+                return false
+            }
+            // Missed release on a toggle/Esc key — re-arm as a fresh press.
+            return true
+        }
         isDown = true
         return true
     }
