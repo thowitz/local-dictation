@@ -23,6 +23,12 @@ final class ServerSupervisor {
         case stalledDownload
     }
 
+    /// Why the controller asked the supervisor to stop the child.
+    enum StopReason: Equatable, Sendable {
+        case idleTimeout
+        case applicationQuit
+    }
+
     /// Injectable seams for deterministic tests.
     struct Dependencies: @unchecked Sendable {
         var resolveCommand: (AppConfig) -> Result<ServerLaunchCommand, ServerLaunchCommandResolver.ResolutionError>
@@ -79,6 +85,11 @@ final class ServerSupervisor {
     /// task from clearing a newer `supervisionTask` after stop()+start().
     private var supervisionRunID = UUID()
     private var stoppingIntentionally = false
+    private var intentionalStopReason: StopReason?
+    /// Controller-facing intent: true while the speech runtime should be resident.
+    private(set) var desiredRunning = false
+    /// Reaps an intentionally stopped child before publishing `.stopped` or relaunching.
+    private var reapingTask: Task<Void, Never>?
     private var generation: UInt64 = 0
 
     private var stdoutPartial = ""
@@ -104,8 +115,72 @@ final class ServerSupervisor {
     }
 
     func start() {
-        guard supervisionTask == nil else { return }
+        desiredRunning = true
+        // Already supervising — leave the current run alone.
+        if supervisionTask != nil { return }
+        // Intentional stop in flight: reap completion will relaunch once.
+        if reapingTask != nil {
+            stoppingIntentionally = false
+            intentionalStopReason = nil
+            if state == .stopped || state == .idle {
+                transition(to: .launching)
+            }
+            return
+        }
+
+        beginSupervision()
+    }
+
+    func retry() {
+        stop(reason: .applicationQuit)
+        start()
+    }
+
+    func stop(reason: StopReason) {
+        desiredRunning = false
+        // Record intent before cancelling readiness or signalling the child.
+        intentionalStopReason = reason
+        stoppingIntentionally = true
+        let stopGeneration = generation
+        generation &+= 1
+        // Invalidate so a still-finishing cancelled supervise() cannot clear a
+        // newer task started by a subsequent start()/retry().
+        supervisionRunID = UUID()
+        supervisionTask?.cancel()
+        supervisionTask = nil
+
+        let child = managed
+        // Detach callbacks so stale handlers cannot mutate state after the generation bump,
+        // but retain `managed` until the child is confirmed gone.
+        if let managed {
+            managed.onStdout = nil
+            managed.onStderr = nil
+            managed.onTerminate = nil
+        }
+        // Unblock any parked EOF waiters immediately (stuck drain / inherited FDs).
+        child?.forceFinishOutputDrain()
+
+        guard let child else {
+            finishIntentionalStop()
+            return
+        }
+
+        if reapingTask != nil {
+            return
+        }
+
+        reapingTask = Task { @MainActor [weak self] in
+            guard let self else {
+                if child.isRunning { child.forceKill() }
+                return
+            }
+            await self.reapIntentionalStop(child: child, stopGeneration: stopGeneration)
+        }
+    }
+
+    private func beginSupervision() {
         stoppingIntentionally = false
+        intentionalStopReason = nil
         stderrCollector.reset()
         activity = .empty
         currentCommand = nil
@@ -127,47 +202,54 @@ final class ServerSupervisor {
         }
     }
 
-    func retry() {
-        stop()
-        start()
-    }
+    private func reapIntentionalStop(child: any ManagedProcess, stopGeneration: UInt64) async {
+        defer { reapingTask = nil }
 
-    func stop() {
-        stoppingIntentionally = true
-        let stopGeneration = generation
-        generation &+= 1
-        // Invalidate so a still-finishing cancelled supervise() cannot clear a
-        // newer task started by a subsequent start()/retry().
-        supervisionRunID = UUID()
-        supervisionTask?.cancel()
-        supervisionTask = nil
-
-        // Retain the child for escalation; clearProcess drops callback wiring first
-        // so stale handlers cannot mutate state after the generation bump.
-        let child = managed
-        clearProcess()
-        // Unblock any parked EOF waiters immediately (stuck drain / inherited FDs).
-        child?.forceFinishOutputDrain()
-        if let child, child.isRunning {
+        if child.isRunning {
             child.terminate()
-            Task { @MainActor [weak self] in
-                guard let self else {
-                    if child.isRunning { child.forceKill() }
-                    return
-                }
-                do {
-                    try await self.deps.sleep(self.policy.terminationGrace)
-                } catch {
-                    if child.isRunning { child.forceKill() }
-                    return
-                }
-                if child.isRunning {
-                    child.forceKill()
-                }
-                _ = stopGeneration
+        }
+        // Only wait out the grace window while the child is still alive.
+        if child.isRunning {
+            do {
+                try await deps.sleep(policy.terminationGrace)
+            } catch {
+                if child.isRunning { child.forceKill() }
+            }
+            if child.isRunning {
+                child.forceKill()
             }
         }
-        transition(to: .stopped)
+
+        // Confirm the child is gone before publishing stopped / relaunching.
+        while child.isRunning {
+            do {
+                try await deps.sleep(policy.readinessPollInterval)
+            } catch {
+                if child.isRunning { child.forceKill() }
+                break
+            }
+        }
+
+        _ = stopGeneration
+        clearProcess()
+        finishIntentionalStop()
+    }
+
+    private func finishIntentionalStop() {
+        let reason = intentionalStopReason
+        intentionalStopReason = nil
+        if desiredRunning {
+            AppLog.server.info(
+                "Intentional stop complete (reason=\(String(describing: reason), privacy: .public)); relaunching because desiredRunning"
+            )
+            beginSupervision()
+        } else {
+            stoppingIntentionally = false
+            transition(to: .stopped)
+            AppLog.server.info(
+                "Intentional stop complete (reason=\(String(describing: reason), privacy: .public))"
+            )
+        }
     }
 
     // MARK: - Supervision loop

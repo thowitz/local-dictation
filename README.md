@@ -118,10 +118,11 @@ A minimal override is enough (port and model default):
 
 - Path must be absolute after `~` expansion and must be executable.
 - Optional keys: `port` (default `8471`), `model` (HF id). An invalid `port` is reported rather than silently defaulted.
+- `idleUnloadMinutes` (default `10`): minutes of inactivity with no dictation request/session before the speech runtime is unloaded to free the ~4 GB model. Positive fractional values are allowed (useful for testing). `0` disables unload and keeps the runtime always resident. Negative values are invalid and fall back to `10` with a diagnostic. After unload the menu shows **Dormant** / Server stopped; the next mic-key or toggle start shows **Warming up…** until `/health` and the WebSocket are ready again.
 
 ## Server status, errors, and recovery
 
-The menu bar shows concise server rows: **Starting…**, **Downloading model…** (with percent when known), **Restarting N/5…**, Ready, or a short failure reason.
+The menu bar shows concise server rows: **Warming up…**, **Downloading model…** (with percent when known), **Restarting N/5…**, Ready, **Unloading…** / Dormant (Server stopped), or a short failure reason.
 
 When the server is restarting or failed:
 

@@ -31,6 +31,7 @@ enum DictationState: Equatable, Sendable {
     case ready
     case listening
     case flushing
+    case unloading
     case restarting(ServerRestartStatus)
     case failed(DictationFailure)
 
@@ -41,7 +42,7 @@ enum DictationState: Equatable, Sendable {
         switch self {
         case .idle, .ready:
             return nil
-        case .starting, .downloading, .restarting:
+        case .starting, .downloading, .restarting, .unloading:
             return .systemOrange
         case .listening:
             return .systemBlue
@@ -55,9 +56,9 @@ enum DictationState: Equatable, Sendable {
     var statusTitle: String {
         switch self {
         case .idle:
-            return "Idle"
+            return "Dormant"
         case .starting:
-            return "Starting…"
+            return "Warming up…"
         case .downloading(let percent):
             if let percent {
                 return "Downloading model… \(percent)%"
@@ -69,6 +70,8 @@ enum DictationState: Equatable, Sendable {
             return "Listening"
         case .flushing:
             return "Flushing…"
+        case .unloading:
+            return "Unloading…"
         case .restarting(let status):
             return status.menuSummary
         case .failed(let failure):
@@ -89,6 +92,29 @@ private enum AppPrefs {
 
 @MainActor
 final class DictationController {
+    /// Injectable seams for lifecycle tests (permissions, audio, clock).
+    struct Dependencies {
+        var sleep: (Duration) async throws -> Void
+        var isSecureEventInputEnabled: () -> Bool
+        var isAccessibilityTrusted: () -> Bool
+        var startAudio: ((@escaping @Sendable (Data) -> Void) throws -> Void)?
+        var stopAudio: (() -> Void)?
+        /// When false, skip AppKit indicator / Esc hotkey side effects (unit tests).
+        var presentsSessionUI: Bool
+
+        @MainActor
+        static func production() -> Dependencies {
+            Dependencies(
+                sleep: { try await Task.sleep(for: $0) },
+                isSecureEventInputEnabled: { TextInserter.isSecureEventInputEnabled() },
+                isAccessibilityTrusted: { AXIsProcessTrusted() },
+                startAudio: nil,
+                stopAudio: nil,
+                presentsSessionUI: true
+            )
+        }
+    }
+
     private(set) var state: DictationState = .idle {
         didSet {
             onStateChange?(state)
@@ -98,8 +124,10 @@ final class DictationController {
     var onStateChange: ((DictationState) -> Void)?
 
     private let config: AppConfig
+    private let deps: Dependencies
     private let supervisor: ServerSupervisor
-    private let realtime: RealtimeClient
+    private let realtime: any DictationRealtimeClient
+    private let idleScheduler: IdleUnloadScheduler
     private let audio = AudioCapture()
     private let textInserter = TextInserter()
     private let indicator = IndicatorPanel()
@@ -116,23 +144,43 @@ final class DictationController {
     private var intent = DictationIntentTracker()
     private var cancellationBarrier = CancellationBarrier()
     private var indicatorActive = false
+    private var didShutdown = false
 
-    init(config: AppConfig) {
+    /// Test seam: whether the idle unload deadline is currently armed.
+    var isIdleSchedulerArmed: Bool { idleScheduler.isArmed }
+
+    convenience init(config: AppConfig) {
+        self.init(config: config, dependencies: .production())
+    }
+
+    init(
+        config: AppConfig,
+        dependencies: Dependencies,
+        supervisor: ServerSupervisor? = nil,
+        realtime: (any DictationRealtimeClient)? = nil
+    ) {
         self.config = config
-        self.supervisor = ServerSupervisor(config: config)
-        self.realtime = RealtimeClient(endpoint: config.websocketURL)
+        self.deps = dependencies
+        self.supervisor = supervisor ?? ServerSupervisor(config: config)
+        self.realtime = realtime ?? RealtimeClient(endpoint: config.websocketURL)
+        self.idleScheduler = IdleUnloadScheduler(
+            timeout: config.idleUnloadTimeout,
+            sleep: dependencies.sleep
+        )
 
         escapeHotKey.onPressed = { [weak self] in
             self?.cancelDictation()
         }
 
-        supervisor.onStateChange = { [weak self] serverState in
+        let priorHandler = self.supervisor.onStateChange
+        self.supervisor.onStateChange = { [weak self] serverState in
+            priorHandler?(serverState)
             Task { @MainActor in
                 self?.handleServerState(serverState)
             }
         }
 
-        realtime.setCallbacks(
+        self.realtime.setCallbacks(
             RealtimeClient.Callbacks(
                 onDelta: { [weak self] delta in
                     Task { @MainActor in
@@ -152,7 +200,6 @@ final class DictationController {
                 onError: { [weak self] message in
                     Task { @MainActor in
                         AppLog.general.error("Realtime error: \(message, privacy: .public)")
-                        // Don't flip the whole UI to error on transient WS blips while idle/ready.
                         if self?.state == .listening || self?.state == .flushing {
                             self?.intent.clearAll()
                             self?.cancellationBarrier.reset()
@@ -175,12 +222,28 @@ final class DictationController {
         supervisor.start()
     }
 
+    /// Idempotent teardown for Quit / `applicationWillTerminate`.
+    func shutdown() {
+        guard !didShutdown else { return }
+        didShutdown = true
+        idleScheduler.cancel()
+        intent.clearAll()
+        cancellationBarrier.reset()
+        escapeHotKey.unregister()
+        stopAudioCapture()
+        textInserter.discard()
+        sessionTranscript = ""
+        endIndicatorSession(playSound: false)
+        realtime.disconnect()
+        supervisor.stop(reason: .applicationQuit)
+    }
+
     /// Toggle: start when idle/ready; commit+flush when listening.
     func toggleDictation() {
         switch state {
         case .listening:
             stopDictation()
-        case .ready, .idle, .failed:
+        case .ready, .idle, .failed, .unloading:
             startDictation()
         default:
             break
@@ -197,6 +260,7 @@ final class DictationController {
         switch intent.handleHoldRelease() {
         case .canceledPending:
             AppLog.general.info("Hold released before readiness — pending intent cleared")
+            armIdleSchedulerIfEligible()
         case .requestStop:
             stopDictation()
         case .ignored:
@@ -209,16 +273,26 @@ final class DictationController {
     }
 
     private func requestStart(intent startIntent: DictationStartIntent) {
+        idleScheduler.cancel()
+
         switch state {
-        case .starting, .downloading, .restarting:
-            // Hold may queue during warm-up without knocking bootstrap into `.failed`.
-            // Secure Input / AX are re-checked at actual capture start in `beginListening`.
+        case .starting, .downloading, .restarting, .unloading:
             if startIntent == .micHold {
-                if TextInserter.isSecureEventInputEnabled() || !AXIsProcessTrusted() {
+                if deps.isSecureEventInputEnabled() || !deps.isAccessibilityTrusted() {
                     intent.clearAll()
                     return
                 }
                 intent.queue(.micHold)
+                if state == .unloading {
+                    transition(to: .starting)
+                    supervisor.start()
+                }
+            } else if state == .unloading {
+                intent.queue(startIntent)
+                transition(to: .starting)
+                supervisor.start()
+            } else if startIntent == .manualToggle {
+                intent.queue(startIntent)
             }
             return
         case .listening, .flushing:
@@ -227,7 +301,7 @@ final class DictationController {
             break
         }
 
-        if TextInserter.isSecureEventInputEnabled() {
+        if deps.isSecureEventInputEnabled() {
             intent.clearAll()
             let message = "Secure input is enabled — dictation refused."
             AppLog.general.error("\(message, privacy: .public)")
@@ -235,7 +309,7 @@ final class DictationController {
             return
         }
 
-        if !AXIsProcessTrusted() {
+        if !deps.isAccessibilityTrusted() {
             intent.clearAll()
             let message = "Accessibility permission required — grant it in System Settings."
             AppLog.general.error("\(message, privacy: .public)")
@@ -254,7 +328,6 @@ final class DictationController {
                 transition(to: .starting)
                 supervisor.start()
             case .failed(.server):
-                // Terminal server failure: retry supervision without opening the mic yet.
                 transition(to: .starting)
                 supervisor.retry()
             default:
@@ -268,12 +341,10 @@ final class DictationController {
     func stopDictation() {
         guard state == .listening else { return }
         intent.clearAll()
-        // Keep Esc armed through flushing so cancel still works mid-flush.
         transition(to: .flushing)
         updateIndicatorProcessing()
-        audio.stop()
+        stopAudioCapture()
         if !realtime.commitFinal() {
-            // Commit could not be enqueued — tear down locally instead of hanging in flushing.
             AppLog.general.error("commitFinal enqueue failed — tearing down locally")
             escapeHotKey.unregister()
             textInserter.discard()
@@ -281,6 +352,7 @@ final class DictationController {
             endIndicatorSession(playSound: true)
             if realtime.isConnected, case .running = supervisor.state {
                 transition(to: .ready)
+                resetIdleSchedulerAfterSession()
             } else {
                 transition(to: .starting)
             }
@@ -289,21 +361,18 @@ final class DictationController {
         AppLog.general.info("Stop dictation — commit final sent")
     }
 
-    /// Esc while active: stop immediately with no flush wait. Already-typed
-    /// stream text stays; buffer-mode buffer is discarded.
+    /// Esc while active: stop immediately with no flush wait.
     func cancelDictation() {
         guard state == .listening || state == .flushing else { return }
         intent.clearAll()
         escapeHotKey.unregister()
-        audio.stop()
+        stopAudioCapture()
         textInserter.discard()
         sessionTranscript = ""
         endIndicatorSession(playSound: true)
 
-        // Quarantine trailing realtime output until the server acks clear.
         cancellationBarrier.beginCancel()
         if !realtime.clearBuffer() {
-            // Clear could not be enqueued — a reconnect owns a fresh session.
             cancellationBarrier.clearEnqueueFailed()
             AppLog.general.info("Dictation cancelled (Esc) — clear enqueue failed, relying on reconnect")
         } else {
@@ -312,9 +381,53 @@ final class DictationController {
 
         if realtime.isConnected, case .running = supervisor.state {
             transition(to: .ready)
+            resetIdleSchedulerAfterSession()
         } else {
             transition(to: .starting)
         }
+    }
+
+    // MARK: - Idle unload
+
+    private func armIdleSchedulerIfEligible() {
+        guard !didShutdown else { return }
+        guard state == .ready else { return }
+        guard case .running = supervisor.state, realtime.isConnected else { return }
+        guard intent.pending == nil, intent.active == nil else { return }
+        idleScheduler.ensureArmed { [weak self] in
+            self?.handleIdleTimeout()
+        }
+    }
+
+    private func resetIdleSchedulerAfterSession() {
+        guard !didShutdown else { return }
+        guard state == .ready else { return }
+        guard case .running = supervisor.state, realtime.isConnected else { return }
+        guard intent.pending == nil, intent.active == nil else { return }
+        idleScheduler.reset { [weak self] in
+            self?.handleIdleTimeout()
+        }
+    }
+
+    private func handleIdleTimeout() {
+        guard !didShutdown else { return }
+        guard intent.pending == nil, intent.active == nil else {
+            AppLog.general.info("Idle unload skipped — dictation request still pending/active")
+            return
+        }
+        guard state != .listening, state != .flushing else {
+            AppLog.general.info("Idle unload skipped — session still active")
+            return
+        }
+        // Unload while the runtime is still resident even if the socket is mid-reconnect
+        // (`.starting` after an idle drop). Do not require `.ready`.
+        guard supervisor.desiredRunning, case .running = supervisor.state else { return }
+        guard state != .unloading, state != .idle else { return }
+
+        AppLog.general.info("Idle unload — disconnecting socket then stopping supervisor")
+        transition(to: .unloading)
+        realtime.disconnect()
+        supervisor.stop(reason: .idleTimeout)
     }
 
     // MARK: - Internals
@@ -325,7 +438,7 @@ final class DictationController {
         else { return }
         guard case .running = supervisor.state, realtime.isConnected else { return }
 
-        if TextInserter.isSecureEventInputEnabled() {
+        if deps.isSecureEventInputEnabled() {
             intent.clearAll()
             let message = "Secure input is enabled — dictation refused (synthetic keys are dropped)."
             AppLog.general.error("\(message, privacy: .public)")
@@ -333,7 +446,7 @@ final class DictationController {
             return
         }
 
-        if !AXIsProcessTrusted() {
+        if !deps.isAccessibilityTrusted() {
             intent.clearAll()
             let message = "Accessibility permission required — grant it in System Settings."
             AppLog.general.error("\(message, privacy: .public)")
@@ -341,15 +454,16 @@ final class DictationController {
             return
         }
 
-        // Do not clearBuffer here — every clear ack must belong to an Esc cancel
-        // so an older start-time acknowledgement cannot open the barrier early.
         sessionTranscript = ""
         textInserter.beginSession()
 
         do {
-            try audio.start { [weak self] chunk in
-                self?.realtime.sendAudio(chunk)
+            let sendAudio: @Sendable (Data) -> Void = { [weak self] chunk in
+                Task { @MainActor in
+                    self?.realtime.sendAudio(chunk)
+                }
             }
+            try startAudioCapture(sendAudio)
         } catch {
             intent.clearAll()
             textInserter.discard()
@@ -358,8 +472,11 @@ final class DictationController {
         }
 
         intent.activatePending()
-        escapeHotKey.register()
-        showIndicatorListening()
+        idleScheduler.cancel()
+        if deps.presentsSessionUI {
+            escapeHotKey.register()
+            showIndicatorListening()
+        }
         transition(to: .listening)
         AppLog.general.info(
             "Dictation started — mode=\(self.textInserter.mode.rawValue, privacy: .public)"
@@ -368,7 +485,10 @@ final class DictationController {
 
     private func beginListeningIfPendingIntent() {
         guard cancellationBarrier.shouldAllowStart(hasPendingIntent: intent.shouldBeginOnReadiness)
-        else { return }
+        else {
+            armIdleSchedulerIfEligible()
+            return
+        }
         guard case .running = supervisor.state, realtime.isConnected else { return }
         beginListening()
     }
@@ -407,10 +527,27 @@ final class DictationController {
         }
     }
 
+    private func startAudioCapture(_ handler: @escaping @Sendable (Data) -> Void) throws {
+        if let startAudio = deps.startAudio {
+            try startAudio(handler)
+        } else {
+            try audio.start(chunkHandler: handler)
+        }
+    }
+
+    private func stopAudioCapture() {
+        if let stopAudio = deps.stopAudio {
+            stopAudio()
+        } else {
+            audio.stop()
+        }
+    }
+
     /// Retry a terminal server failure without opening the microphone.
     func retryServer() {
         intent.clearAll()
         cancellationBarrier.reset()
+        idleScheduler.cancel()
         transition(to: .starting)
         supervisor.retry()
     }
@@ -418,21 +555,22 @@ final class DictationController {
     private func handleServerState(_ serverState: ServerSupervisor.State) {
         switch serverState {
         case .idle, .stopped:
-            if state != .idle {
-                interruptActiveSessionIfNeeded()
-                realtime.disconnect()
+            idleScheduler.cancel()
+            if state == .unloading || state != .idle {
+                if state != .unloading {
+                    interruptActiveSessionIfNeeded()
+                    realtime.disconnect()
+                }
                 transition(to: .idle)
             }
 
         case .launching, .waitingForReady:
-            if state != .listening && state != .flushing {
+            if state != .listening && state != .flushing && state != .unloading {
                 transition(to: .starting)
             }
 
         case .restarting(let status):
-            // Process died between generations — interrupt any active session,
-            // then ALWAYS surface Restarting N/5 (do not leave UI as listening
-            // for a later generic .starting from the realtime disconnect path).
+            idleScheduler.cancel()
             interruptActiveSessionIfNeeded()
             transition(to: .restarting(status))
 
@@ -442,9 +580,6 @@ final class DictationController {
             }
 
         case .running:
-            // Open (or keep) the persistent WebSocket once the server is healthy.
-            // After an interruption, intent was cleared — do not reopen mic unless
-            // a still-pending request remains (e.g. hold held through warm-up).
             if !realtime.isConnected {
                 realtime.connect()
             } else if state != .listening && state != .flushing {
@@ -453,23 +588,20 @@ final class DictationController {
             }
 
         case .failed(let failure):
+            idleScheduler.cancel()
             interruptActiveSessionIfNeeded()
             realtime.disconnect()
             transition(to: .failed(.server(failure)))
         }
     }
 
-    /// Narrow crash/interrupt cleanup: stop audio, keep already-inserted live
-    /// text, discard uninserted terminal-target buffer, end indicator, clear
-    /// Esc + intent. Does not reopen the mic on later recovery.
     private func interruptActiveSessionIfNeeded() {
         let wasActive = state == .listening || state == .flushing
         guard wasActive else { return }
         intent.interruptActiveSession()
         cancellationBarrier.reset()
         escapeHotKey.unregister()
-        audio.stop()
-        // discard() keeps already-inserted live text; drops only the uninserted buffer.
+        stopAudioCapture()
         textInserter.discard()
         sessionTranscript = ""
         endIndicatorSession(playSound: true)
@@ -488,18 +620,21 @@ final class DictationController {
         case .connecting:
             break
         case .disconnected:
+            if state == .unloading || didShutdown {
+                return
+            }
             cancellationBarrier.reset()
             if state == .listening {
                 intent.interruptActiveSession()
                 escapeHotKey.unregister()
-                audio.stop()
+                stopAudioCapture()
                 textInserter.discard()
                 endIndicatorSession(playSound: true)
                 transition(to: .starting)
             } else if state == .ready {
+                // Transient idle reconnect does not reset the idle deadline.
                 transition(to: .starting)
             } else if state == .flushing {
-                // Final may never arrive — recover to ready/starting.
                 intent.clearAll()
                 escapeHotKey.unregister()
                 textInserter.discard()
@@ -514,7 +649,6 @@ final class DictationController {
         sessionTranscript += delta
         print("[transcript delta] \(delta)")
         AppLog.general.info("delta: \(delta, privacy: .public)")
-        // Stream mode types live; buffer mode accumulates until flush/done.
         textInserter.handleDelta(delta)
     }
 
@@ -526,10 +660,6 @@ final class DictationController {
         sessionTranscript = ""
 
         if state == .flushing {
-            // Buffer mode: insert the accumulated (sanitized) text once.
-            // Stream mode: trailing deltas were already typed via handleDelta;
-            // flush() is a no-op there. Any delta that arrived after commit
-            // but before done was already routed through handleDelta.
             let inserted = textInserter.flush()
             if !inserted.isEmpty {
                 AppLog.general.info(
@@ -539,9 +669,9 @@ final class DictationController {
             intent.clearAll()
             escapeHotKey.unregister()
             endIndicatorSession(playSound: true)
-            // Return to ready if server+ws are still up.
             if realtime.isConnected, case .running = supervisor.state {
                 transition(to: .ready)
+                resetIdleSchedulerAfterSession()
             } else {
                 transition(to: .starting)
             }
@@ -550,7 +680,6 @@ final class DictationController {
 
     private func transition(to newState: DictationState) {
         guard state != newState else { return }
-        // Tear down Esc registration whenever we leave an active session.
         switch newState {
         case .listening, .flushing:
             break
@@ -1020,8 +1149,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggleHotKey.unregister()
         f13HotKey.unregister()
         micKeyInterpreter.reset()
-        controller.cancelDictation()
+        controller.shutdown()
         NSApp.terminate(nil)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        toggleHotKey.unregister()
+        f13HotKey.unregister()
+        micKeyInterpreter.reset()
+        controller?.shutdown()
     }
 
     private func runFirstRunChecksIfNeeded() {
@@ -1096,7 +1232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .listening:
             startStopItem.title = "Stop Dictation"
             startStopItem.isEnabled = true
-        case .ready, .idle, .failed:
+        case .ready, .idle, .failed, .unloading:
             startStopItem.title = "Start Dictation"
             startStopItem.isEnabled = true
         case .starting, .downloading, .flushing, .restarting:

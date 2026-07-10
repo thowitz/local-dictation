@@ -46,7 +46,7 @@ struct DictationPresentationTests {
 
     @Test("Row text for starting downloading restarting ready and failures")
     func rowTextForCoreStates() {
-        #expect(DictationPresentation.serverRowTitle(for: .starting) == "Server: Starting…")
+        #expect(DictationPresentation.serverRowTitle(for: .starting) == "Server: Warming up…")
         #expect(
             DictationPresentation.serverRowTitle(for: .downloading(percent: 40))
                 == "Server: Downloading model… 40%"
@@ -60,6 +60,8 @@ struct DictationPresentationTests {
                 .contains("Restarting 2/5")
         )
         #expect(DictationPresentation.serverRowTitle(for: .ready) == "Server: Running")
+        #expect(DictationPresentation.serverRowTitle(for: .unloading) == "Server: Stopping…")
+        #expect(DictationPresentation.serverRowTitle(for: .idle) == "Server: Stopped")
 
         for kind in ServerFailure.Kind.allCases {
             let title = DictationPresentation.serverRowTitle(
@@ -68,6 +70,24 @@ struct DictationPresentationTests {
             #expect(title.hasPrefix("Server: "))
             #expect(!title.contains("boom"))
         }
+    }
+
+    @Test("Dormant unloading and warm-up status titles")
+    func dormantUnloadingAndWarmUpStatusTitles() {
+        #expect(DictationState.idle.statusTitle == "Dormant")
+        #expect(DictationState.unloading.statusTitle == "Unloading…")
+        #expect(DictationState.starting.statusTitle == "Warming up…")
+        #expect(DictationState.ready.statusTitle == "Ready")
+    }
+
+    @Test("Reducer maps stopped after unloading to dormant idle")
+    func reducerMapsStoppedAfterUnloadingToIdle() {
+        #expect(
+            DictationServerStateReducer.apply(.stopped, current: .unloading) == .idle
+        )
+        #expect(
+            DictationServerStateReducer.apply(.launching, current: .idle) == .starting
+        )
     }
 
     @Test("Details and retry visibility limited to server restart and failure")

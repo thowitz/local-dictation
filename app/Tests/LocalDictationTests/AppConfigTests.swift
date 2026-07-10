@@ -11,6 +11,8 @@ struct AppConfigTests {
         #expect(config.serverExecutable == "/tmp/custom-serve")
         #expect(config.port == AppConfig.defaultPort)
         #expect(config.model == nil)
+        #expect(config.idleUnloadMinutes == AppConfig.defaultIdleUnloadMinutes)
+        #expect(config.idleUnloadTimeout == .seconds(AppConfig.defaultIdleUnloadMinutes * 60))
     }
 
     @Test("Explicit port and model decode")
@@ -20,6 +22,49 @@ struct AppConfigTests {
         #expect(config.serverExecutable == "/opt/serve")
         #expect(config.port == 9001)
         #expect(config.model == "mlx-community/foo")
+        #expect(config.idleUnloadMinutes == AppConfig.defaultIdleUnloadMinutes)
+    }
+
+    @Test("Custom idleUnloadMinutes decodes")
+    func customIdleUnloadMinutesDecodes() throws {
+        let json = #"{"idleUnloadMinutes": 5}"#
+        let config = try AppConfig.decode(Data(json.utf8))
+        #expect(config.idleUnloadMinutes == 5)
+        #expect(config.idleUnloadTimeout == .seconds(5 * 60))
+    }
+
+    @Test("Fractional idleUnloadMinutes is valid")
+    func fractionalIdleUnloadMinutesIsValid() throws {
+        let json = #"{"idleUnloadMinutes": 0.05}"#
+        let config = try AppConfig.decode(Data(json.utf8))
+        #expect(config.idleUnloadMinutes == 0.05)
+        #expect(config.idleUnloadTimeout == .seconds(0.05 * 60))
+    }
+
+    @Test("Zero idleUnloadMinutes disables unload")
+    func zeroIdleUnloadMinutesDisablesUnload() throws {
+        let json = #"{"idleUnloadMinutes": 0}"#
+        let config = try AppConfig.decode(Data(json.utf8))
+        #expect(config.idleUnloadMinutes == 0)
+        #expect(config.idleUnloadTimeout == nil)
+    }
+
+    @Test("Negative idleUnloadMinutes falls back to default")
+    func negativeIdleUnloadMinutesFallsBackToDefault() throws {
+        let json = #"{"idleUnloadMinutes": -3}"#
+        let config = try AppConfig.decode(Data(json.utf8))
+        #expect(config.idleUnloadMinutes == AppConfig.defaultIdleUnloadMinutes)
+        #expect(config.idleUnloadTimeout == .seconds(AppConfig.defaultIdleUnloadMinutes * 60))
+    }
+
+    @Test("Idle unload decode preserves resolver fields")
+    func idleUnloadDecodePreservesResolverFields() throws {
+        let json = #"{"serverExecutable": "/opt/serve", "port": 9001, "model": "mlx-community/foo", "idleUnloadMinutes": 2.5}"#
+        let config = try AppConfig.decode(Data(json.utf8))
+        #expect(config.serverExecutable == "/opt/serve")
+        #expect(config.port == 9001)
+        #expect(config.model == "mlx-community/foo")
+        #expect(config.idleUnloadMinutes == 2.5)
     }
 
     @Test("Invalid port is actionable")

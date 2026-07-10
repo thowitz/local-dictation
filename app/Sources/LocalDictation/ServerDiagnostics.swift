@@ -745,11 +745,13 @@ enum DictationPresentation: Sendable {
             }
             return "Server: Downloading model…"
         case .starting:
-            return "Server: Starting…"
+            return "Server: Warming up…"
         case .restarting(let status):
             return "Server: \(status.menuSummary)"
         case .ready, .listening, .flushing:
             return "Server: Running"
+        case .unloading:
+            return "Server: Stopping…"
         case .idle:
             return "Server: Stopped"
         case .failed(let failure):
@@ -836,6 +838,9 @@ enum DictationServerStateReducer {
     ) -> DictationState {
         switch serverState {
         case .idle, .stopped:
+            if current == .unloading {
+                return .idle
+            }
             return .idle
         case .launching, .waitingForReady:
             if current == .listening || current == .flushing {

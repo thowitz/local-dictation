@@ -13,9 +13,21 @@ struct AppConfig: Codable, Sendable {
     /// Optional HF model id override passed as `--model`.
     var model: String?
 
+    /// Minutes of inactivity before unloading the speech runtime.
+    /// `0` disables unload; omitted/negative values resolve to `defaultIdleUnloadMinutes`.
+    var idleUnloadMinutes: Double
+
     static let defaultPort = 8471
+    static let defaultIdleUnloadMinutes: Double = 10
     static let supportDirectoryName = "LocalDictation"
     static let configFileName = "config.json"
+
+    enum CodingKeys: String, CodingKey {
+        case serverExecutable
+        case port
+        case model
+        case idleUnloadMinutes
+    }
 
     enum ValidationError: Error, Equatable, CustomStringConvertible {
         case invalidPort(Int)
@@ -37,10 +49,16 @@ struct AppConfig: Codable, Sendable {
         supportDirectoryURL.appendingPathComponent(configFileName)
     }
 
-    init(serverExecutable: String? = nil, port: Int = defaultPort, model: String? = nil) {
+    init(
+        serverExecutable: String? = nil,
+        port: Int = defaultPort,
+        model: String? = nil,
+        idleUnloadMinutes: Double = defaultIdleUnloadMinutes
+    ) {
         self.serverExecutable = serverExecutable
         self.port = port
         self.model = model
+        self.idleUnloadMinutes = Self.normalizedIdleUnloadMinutes(idleUnloadMinutes)
     }
 
     init(from decoder: Decoder) throws {
@@ -48,6 +66,25 @@ struct AppConfig: Codable, Sendable {
         serverExecutable = try container.decodeIfPresent(String.self, forKey: .serverExecutable)
         port = try container.decodeIfPresent(Int.self, forKey: .port) ?? Self.defaultPort
         model = try container.decodeIfPresent(String.self, forKey: .model)
+        let rawIdle = try container.decodeIfPresent(Double.self, forKey: .idleUnloadMinutes)
+        idleUnloadMinutes = Self.normalizedIdleUnloadMinutes(rawIdle ?? Self.defaultIdleUnloadMinutes)
+    }
+
+    /// Effective idle timeout, or `nil` when unload is disabled (`idleUnloadMinutes == 0`).
+    var idleUnloadTimeout: Duration? {
+        guard idleUnloadMinutes > 0 else { return nil }
+        return .seconds(idleUnloadMinutes * 60)
+    }
+
+    /// Normalize raw config: negative → default (with diagnostic), zero stays disabled.
+    private static func normalizedIdleUnloadMinutes(_ raw: Double) -> Double {
+        if raw < 0 {
+            AppLog.general.error(
+                "Invalid idleUnloadMinutes \(raw, privacy: .public); expected >= 0. Using default \(Self.defaultIdleUnloadMinutes, privacy: .public)."
+            )
+            return defaultIdleUnloadMinutes
+        }
+        return raw
     }
 
     /// Decodes JSON and validates port. Unlike `load()`, this surfaces invalid ports

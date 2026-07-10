@@ -7,7 +7,7 @@ import Foundation
 @MainActor
 final class FakeClock {
     private(set) var now: Date
-    private var sleepers: [(deadline: Date, continuation: CheckedContinuation<Void, Error>)] = []
+    private var sleepers: [(id: UUID, deadline: Date, continuation: CheckedContinuation<Void, Error>)] = []
 
     init(start: Date = Date(timeIntervalSince1970: 1_000_000)) {
         self.now = start
@@ -24,13 +24,14 @@ final class FakeClock {
             return
         }
 
+        let id = UUID()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                sleepers.append((deadline, cont))
+                sleepers.append((id, deadline, cont))
             }
         } onCancel: {
             Task { @MainActor [weak self] in
-                self?.failAllSleepers(CancellationError())
+                self?.failSleeper(id: id)
             }
         }
     }
@@ -57,11 +58,11 @@ final class FakeClock {
         }
     }
 
-    private func failAllSleepers(_ error: Error) {
-        let pending = sleepers
-        sleepers.removeAll()
-        for sleeper in pending {
-            sleeper.continuation.resume(throwing: error)
+    /// Cancel only this sleeper — shared clocks must not wake every waiter on one cancel.
+    private func failSleeper(id: UUID) {
+        if let idx = sleepers.firstIndex(where: { $0.id == id }) {
+            let sleeper = sleepers.remove(at: idx)
+            sleeper.continuation.resume(throwing: CancellationError())
         }
     }
 }
@@ -84,6 +85,9 @@ final class FakeManagedProcess: ManagedProcess {
         /// If true, `isRunning` clears before `exit` becomes readable via the stored
         /// publication path — mirrors Foundation's terminationHandler MainActor hop.
         var deferExitPublication: Bool
+        /// If true, `terminate()` / `forceKill()` record the signal but leave the
+        /// process running until `completeExit` — for intentional-stop reap races.
+        var holdTerminateExit: Bool
 
         init(
             stdoutChunks: [Data] = [],
@@ -93,7 +97,8 @@ final class FakeManagedProcess: ManagedProcess {
             emitOnLaunch: Bool = true,
             holdExit: Bool = false,
             neverEOF: Bool = false,
-            deferExitPublication: Bool = false
+            deferExitPublication: Bool = false,
+            holdTerminateExit: Bool = false
         ) {
             self.stdoutChunks = stdoutChunks
             self.stderrChunks = stderrChunks
@@ -103,6 +108,7 @@ final class FakeManagedProcess: ManagedProcess {
             self.holdExit = holdExit
             self.neverEOF = neverEOF
             self.deferExitPublication = deferExitPublication
+            self.holdTerminateExit = holdTerminateExit
         }
     }
 
@@ -112,6 +118,8 @@ final class FakeManagedProcess: ManagedProcess {
     private(set) var forceKillCount = 0
     private(set) var processIdentifier: Int32 = 4242
     private(set) var isRunning = false
+    private(set) var launchArguments: [String] = []
+    private(set) var launchExecutableURL: URL?
     /// Termination facts recorded as soon as the process stops (like Process.terminationStatus).
     private var recordedTermination: ManagedProcessExit?
     /// Lazily published exit (old buggy path); only set after a MainActor hop when deferred.
@@ -155,6 +163,8 @@ final class FakeManagedProcess: ManagedProcess {
             let script = scripts.isEmpty ? Script(holdExit: true) : scripts.removeFirst()
             let process = FakeManagedProcess(script: script)
             process.processIdentifier = nextPID
+            process.launchExecutableURL = executableURL
+            process.launchArguments = arguments
             nextPID += 1
             created.append(process)
             return process
@@ -234,14 +244,14 @@ final class FakeManagedProcess: ManagedProcess {
 
     func terminate() {
         terminateCount += 1
-        if isRunning {
+        if isRunning, !script.holdTerminateExit {
             completeExit(.signaled(signal: SIGTERM))
         }
     }
 
     func forceKill() {
         forceKillCount += 1
-        if isRunning {
+        if isRunning, !script.holdTerminateExit {
             completeExit(.signaled(signal: SIGKILL))
         }
     }
@@ -378,8 +388,8 @@ final class SupervisorHarness {
         supervisor.start()
     }
 
-    func stop() {
-        supervisor.stop()
+    func stop(reason: ServerSupervisor.StopReason = .applicationQuit) {
+        supervisor.stop(reason: reason)
     }
 
     /// Pump the cooperative scheduler and advance the fake clock.

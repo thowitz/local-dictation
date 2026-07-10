@@ -28,11 +28,20 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
     private var reconnectTask: Task<Void, Never>?
     private var reconnectAttempt = 0
     private var shouldAutoReconnect = true
+    /// Bumped on explicit connect/disconnect so stale delayed reconnect work cannot reopen.
+    private var connectionEpoch: UInt64 = 0
 
     private let maxReconnectBackoff: Double = 30
+    /// Test seam: runs after the reconnect allow-check and before `openSocket()`.
+    var reconnectRaceHook: (() -> Void)?
+    private let sleep: (Duration) async throws -> Void
 
-    init(endpoint: URL) {
+    init(
+        endpoint: URL,
+        sleep: @escaping (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+    ) {
         self.endpoint = endpoint
+        self.sleep = sleep
         super.init()
     }
 
@@ -52,6 +61,7 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
         lock.lock()
         shouldAutoReconnect = true
         userInitiatedDisconnect = false
+        connectionEpoch &+= 1
         reconnectTask?.cancel()
         reconnectTask = nil
         lock.unlock()
@@ -60,14 +70,18 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
 
     func disconnect() {
         lock.lock()
+        let alreadyDisconnected = connectionState == .disconnected && task == nil
         shouldAutoReconnect = false
         userInitiatedDisconnect = true
+        connectionEpoch &+= 1
         reconnectTask?.cancel()
         reconnectTask = nil
         closeSocketLocked(cancelTask: true)
         let cbs = callbacks
         lock.unlock()
-        cbs.onConnectionState?(.disconnected)
+        if !alreadyDisconnected {
+            cbs.onConnectionState?(.disconnected)
+        }
     }
 
     func sendAudio(_ pcm16: Data) {
@@ -226,14 +240,33 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
         scheduleReconnect(attempt: attempt + 1)
     }
 
+    /// Test seam: unexpected transport loss that schedules auto-reconnect.
+    func simulateUnexpectedDisconnectForTesting() {
+        handleSocketFailure("test unexpected disconnect")
+    }
+
+    /// Test seam: enable auto-reconnect without opening a live socket.
+    func enableAutoReconnectForTesting() {
+        lock.lock()
+        shouldAutoReconnect = true
+        userInitiatedDisconnect = false
+        // Pretend we were connected so failure publishes a clean disconnect transition.
+        if connectionState == .disconnected {
+            connectionState = .connected
+        }
+        lock.unlock()
+    }
+
     private func scheduleReconnect(attempt: Int) {
         lock.lock()
         reconnectAttempt = attempt
+        let epoch = connectionEpoch
         reconnectTask?.cancel()
         let backoff = min(maxReconnectBackoff, 0.5 * pow(2.0, Double(max(0, attempt - 1))))
+        let sleep = self.sleep
         reconnectTask = Task { [weak self] in
             do {
-                try await Task.sleep(for: .seconds(backoff))
+                try await sleep(.seconds(backoff))
             } catch {
                 return
             }
@@ -241,9 +274,18 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
             // Hop off the async context before touching NSLock (Swift 6).
             DispatchQueue.global(qos: .utility).async {
                 self.lock.lock()
-                let allowed = self.shouldAutoReconnect
+                let allowed = self.shouldAutoReconnect && self.connectionEpoch == epoch
                 self.lock.unlock()
                 guard allowed else { return }
+                // Race window: disconnect() may interleave here before openSocket().
+                self.reconnectRaceHook?()
+                self.lock.lock()
+                let stillValid = self.shouldAutoReconnect && self.connectionEpoch == epoch
+                self.lock.unlock()
+                guard stillValid else {
+                    AppLog.realtime.info("Skipping stale reconnect (attempt \(attempt)) after disconnect")
+                    return
+                }
                 AppLog.realtime.info("Reconnecting (attempt \(attempt)) after \(backoff)s")
                 self.openSocket()
             }

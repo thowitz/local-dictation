@@ -656,6 +656,167 @@ struct ServerSupervisorTests {
             await h.pump(times: 2)
         }
     }
+
+    // MARK: - Intentional stop / desired-running
+
+    @Test("idleTimeout stop reaps child, publishes stopped, consumes no failure budget")
+    func idleTimeoutStopReapsWithoutFailureBudget() async {
+        let scripts = [
+            FakeManagedProcess.Script(exitAfterLaunch: nil, holdExit: true),
+            FakeManagedProcess.Script(exitAfterLaunch: nil, holdExit: true),
+        ]
+        var policy = ServerSupervisorPolicy.test
+        policy.inactivityTimeout = .seconds(30)
+        policy.absoluteStartupCap = .seconds(30)
+        let h = SupervisorHarness(policy: policy, scripts: scripts)
+        h.healthOK = true
+        h.start()
+        await h.waitUntil { h.states.contains(.running) }
+        #expect(h.supervisor.desiredRunning)
+
+        h.stop(reason: .idleTimeout)
+        await h.waitUntil { h.states.contains(.stopped) }
+
+        #expect(h.supervisor.state == .stopped)
+        #expect(!h.supervisor.desiredRunning)
+        #expect(failures(h).isEmpty)
+        #expect(restartStatuses(h).isEmpty)
+        #expect(h.factory.created.first?.isRunning == false)
+        #expect(h.factory.created.count == 1)
+
+        // No spontaneous relaunch after intentional unload.
+        await h.pump(advance: .milliseconds(50), times: 10)
+        #expect(h.factory.created.count == 1)
+        #expect(h.supervisor.state == .stopped)
+    }
+
+    @Test("applicationQuit stop also reaps without restart")
+    func applicationQuitStopReapsWithoutRestart() async {
+        let scripts = [
+            FakeManagedProcess.Script(exitAfterLaunch: nil, holdExit: true)
+        ]
+        var policy = ServerSupervisorPolicy.test
+        policy.inactivityTimeout = .seconds(30)
+        let h = SupervisorHarness(policy: policy, scripts: scripts)
+        h.healthOK = true
+        h.start()
+        await h.waitUntil { h.states.contains(.running) }
+
+        h.stop(reason: .applicationQuit)
+        await h.waitUntil { h.states.contains(.stopped) }
+
+        #expect(h.supervisor.state == .stopped)
+        #expect(failures(h).isEmpty)
+        #expect(restartStatuses(h).isEmpty)
+        #expect(h.factory.created.count == 1)
+    }
+
+    @Test("unexpected exit while desired-running still restarts")
+    func unexpectedExitWhileDesiredRunningStillRestarts() async {
+        let scripts = [
+            FakeManagedProcess.Script(exitAfterLaunch: .exited(status: 7), holdExit: false),
+            FakeManagedProcess.Script(exitAfterLaunch: nil, holdExit: true),
+        ]
+        var policy = ServerSupervisorPolicy.test
+        policy.backoffBaseSeconds = 0.01
+        policy.backoffCapSeconds = 0.02
+        policy.healthyStabilityWindow = .milliseconds(200)
+        let h = SupervisorHarness(policy: policy, scripts: scripts)
+        h.healthOK = true
+        h.start()
+
+        await h.waitUntil { self.restartStatuses(h).contains { $0.attempt == 1 } }
+        #expect(restartStatuses(h).contains { $0.latestExit.statusCode == 7 })
+        await h.waitUntil { h.factory.created.count >= 2 }
+        #expect(h.supervisor.desiredRunning)
+    }
+
+    @Test("start during intentional reap queues exactly one relaunch with same command")
+    func startDuringReapQueuesExactlyOneRelaunch() async {
+        let command = ServerLaunchCommand(
+            executableURL: URL(fileURLWithPath: "/tmp/fake-serve"),
+            argumentPrefix: ["-I", "-B"],
+            source: .development
+        )
+        let scripts = [
+            FakeManagedProcess.Script(
+                exitAfterLaunch: nil,
+                holdExit: true,
+                holdTerminateExit: true
+            ),
+            FakeManagedProcess.Script(exitAfterLaunch: nil, holdExit: true),
+        ]
+        var policy = ServerSupervisorPolicy.test
+        policy.terminationGrace = .milliseconds(10)
+        policy.inactivityTimeout = .seconds(30)
+        let h = SupervisorHarness(policy: policy, scripts: scripts, command: command)
+        h.healthOK = true
+        h.start()
+        await h.waitUntil { h.states.contains(.running) }
+        let first = h.factory.created[0]
+        #expect(first.launchArguments.contains("--parent-pid"))
+
+        h.stop(reason: .idleTimeout)
+        await h.pump(advance: .milliseconds(5), times: 4)
+        #expect(first.terminateCount >= 1)
+        #expect(first.isRunning)
+        #expect(h.factory.created.count == 1)
+
+        h.start()
+        #expect(h.supervisor.desiredRunning)
+        await h.pump(advance: .milliseconds(20), times: 4)
+        // Still reaping — no second child yet.
+        #expect(h.factory.created.count == 1)
+
+        first.completeExit(.signaled(signal: SIGTERM))
+        await h.waitUntil { h.factory.created.count == 2 }
+        await h.waitUntil { h.states.contains(.running) }
+
+        #expect(h.factory.created.count == 2)
+        let second = h.factory.created[1]
+        #expect(second.launchExecutableURL == command.executableURL)
+        #expect(second.launchArguments.contains("--parent-pid"))
+        #expect(
+            Array(second.launchArguments.prefix(command.argumentPrefix.count))
+                == command.argumentPrefix
+        )
+        #expect(failures(h).isEmpty)
+    }
+
+    @Test("stale generation after intentional stop cannot clear a newer run")
+    func staleGenerationAfterIntentionalStopCannotClearNewerRun() async {
+        let scripts = [
+            FakeManagedProcess.Script(
+                exitAfterLaunch: nil,
+                holdExit: true,
+                holdTerminateExit: true
+            ),
+            FakeManagedProcess.Script(exitAfterLaunch: nil, holdExit: true),
+        ]
+        var policy = ServerSupervisorPolicy.test
+        policy.terminationGrace = .milliseconds(10)
+        policy.inactivityTimeout = .seconds(30)
+        let h = SupervisorHarness(policy: policy, scripts: scripts)
+        h.healthOK = true
+        h.start()
+        await h.waitUntil { h.states.contains(.running) }
+        let first = h.factory.created[0]
+
+        h.stop(reason: .idleTimeout)
+        await h.pump(advance: .milliseconds(5), times: 3)
+        h.start()
+        first.completeExit(.signaled(signal: SIGTERM))
+        await h.waitUntil { h.factory.created.count == 2 }
+        await h.waitUntil { h.states.contains(.running) }
+
+        let count = h.states.count
+        first.emitStderr("downloading: 99%| leftover\n")
+        await h.pump(advance: .milliseconds(50), times: 8)
+
+        #expect(h.states.count == count)
+        #expect(h.states.contains(.running))
+        #expect(failures(h).isEmpty)
+    }
 }
 
 @Suite("PortProbe")
