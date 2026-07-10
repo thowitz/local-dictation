@@ -46,19 +46,24 @@ struct DictationIntentTrackerTests {
         #expect(tracker.handleHoldRelease() == .ignored)
     }
 
-    @Test("Release during reconnect removes requeued hold")
+    @Test("Release during reconnect removes hold queued while reconnecting")
     func releaseDuringReconnectRemovesRequeuedHold() {
-        var tracker = DictationIntentTracker()
-        tracker.queue(.micHold)
-        tracker.activatePending()
-        // Transport loss: active hold is requeued as pending so reconnect cannot
-        // auto-start, but a later physical release can still clear it.
-        tracker.interruptActiveSession()
-        #expect(tracker.active == nil)
-        #expect(tracker.pending == .micHold)
-        #expect(tracker.handleHoldRelease() == .canceledPending)
-        #expect(tracker.pending == nil)
-        #expect(!tracker.shouldBeginOnReadiness)
+        // Active hold interrupted: ownership cleared so reconnect cannot auto-start.
+        var interrupted = DictationIntentTracker()
+        interrupted.queue(.micHold)
+        interrupted.activatePending()
+        interrupted.interruptActiveSession()
+        #expect(interrupted.active == nil)
+        #expect(interrupted.pending == nil)
+        #expect(!interrupted.shouldBeginOnReadiness)
+        #expect(interrupted.handleHoldRelease() == .ignored)
+
+        // Hold pressed again while reconnecting (pending), then released before ready.
+        var requeued = DictationIntentTracker()
+        requeued.queue(.micHold)
+        #expect(requeued.handleHoldRelease() == .canceledPending)
+        #expect(requeued.pending == nil)
+        #expect(!requeued.shouldBeginOnReadiness)
     }
 
     @Test("Manual intent is not ended by unrelated hold release")

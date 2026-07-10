@@ -132,14 +132,10 @@ struct DictationIntentTracker: Equatable, Sendable {
         return .ignored
     }
 
-    /// Transport/runtime interrupt: drop active ownership so reconnect cannot reopen the mic.
-    /// If an active hold is interrupted, requeue it as pending so a later physical release
-    /// can still clear it (release-during-reconnect).
+    /// Transport/runtime interrupt: drop all intent so reconnect cannot reopen the mic.
+    /// A later physical hold release is a no-op; a new press can queue again.
     mutating func interruptActiveSession() {
-        if active == .micHold {
-            pending = .micHold
-        }
-        active = nil
+        clearAll()
     }
 
     /// Esc, hard failure, or completed finalization — clear all intent.
