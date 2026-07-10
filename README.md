@@ -20,7 +20,7 @@ make app      # swift build -c release
 make run      # launch the menu-bar app
 ```
 
-The app starts and watches `server/.venv/bin/local-dictation-serve` itself (default port **8471**, model `mlx-community/Voxtral-Mini-4B-Realtime-6bit`). You do not need to run the server in a separate terminal for normal use.
+On launch the app **resolves** a server launch command (see [Server launch command](#server-launch-command) below). In a development checkout that is typically `server/.venv/bin/local-dictation-serve` (default port **8471**, model `mlx-community/Voxtral-Mini-4B-Realtime-6bit`). You do not need to run the server in a separate terminal for normal use.
 
 Install the mic-key remap from the app menu (**Install mic-key remap…**), or manually:
 
@@ -59,6 +59,50 @@ Otherwise macOS will steal the mic key:
 
 In terminal-like apps (Terminal, iTerm2, Ghostty, Warp, kitty, Alacritty, and AX-detected shells), text is **buffered and inserted once on stop**. Newlines/tabs become spaces so a mid-stream newline cannot submit a command.
 
+## Server launch command
+
+The app does **not** hard-code a repo path. At each start/retry it resolves a `ServerLaunchCommand` in this order:
+
+1. **Absolute override** — if `serverExecutable` is set in config, that path wins. It must be absolute (after `~` expansion) and executable. An invalid override **fails authoritatively** (no fallback to packaged/dev candidates).
+2. **Packaged bundle helper** — when running from a `.app` bundle:
+   ```
+   <LocalDictation.app>/Contents/Helpers/LocalDictationServer/bin/python3 \
+     -I -B -u -m local_dictation_server.server
+   ```
+   Issue **#4 only recognizes this layout**; `make package` / issue **#5** actually creates it.
+3. **Application Support** — `~/Library/Application Support/LocalDictation/server/bin/local-dictation-serve`, then `…/server/.venv/bin/local-dictation-serve`.
+4. **Development checkout** — walk ancestors from the running executable for a repo root that contains both `server/` and `app/`, then use `server/.venv/bin/local-dictation-serve`.
+
+### Config override
+
+Config lives at `~/Library/Application Support/LocalDictation/config.json` and is read **at startup** — edits require an **app relaunch**.
+
+A minimal override is enough (port and model default):
+
+```json
+{"serverExecutable": "/abs/path/to/serve"}
+```
+
+- Path must be absolute after `~` expansion and must be executable.
+- Optional keys: `port` (default `8471`), `model` (HF id). An invalid `port` is reported rather than silently defaulted.
+
+## Server status, errors, and recovery
+
+The menu bar shows concise server rows: **Starting…**, **Downloading model…** (with percent when known), **Restarting N/5…**, Ready, or a short failure reason.
+
+When the server is restarting or failed:
+
+- **Show Server Details…** — launch command/source, port, timing, download progress, exit facts, and a **bounded recent stderr tail**, with **Copy Details**.
+- **Retry Server** — re-resolves the launch command and restarts supervision **without** opening the mic.
+
+Port-in-use, launch failure, readiness timeout, and repeated exits each show a concise reason plus a next step. Recent stderr is visible and copyable in-app — you do not need Console.app for normal diagnosis.
+
+### First-download behavior
+
+Startup is **activity-aware**: ongoing model-download (or other) output keeps readiness waiting alive. Prolonged silence (or an absolute startup cap) times out with details that say which deadline fired. **`/health` HTTP 200 is the sole readiness signal** — stdout markers are diagnostic only.
+
+Prefer `make model` beforehand on a good network so the first supervised start does not download ~3.5 GB cold.
+
 ## Makefile targets
 
 | Target | What it does |
@@ -69,8 +113,20 @@ In terminal-like apps (Terminal, iTerm2, Ghostty, Warp, kitty, Alacritty, and AX
 | `make model` | Pre-download the default Hugging Face model |
 | `make remap` / `make unremap` | Direct `hidutil` UserKeyMapping set/clear |
 | `make smoke` | Generate test WAV, briefly start server, run `ws_smoke.py` |
+| `make test` | Swift tests in `app/` + Python `unittest` in `server/tests/` |
 | `make lint` | `ruff check`, `ruff format --check`, `ty check` |
 | `make clean` | Remove `.build`, `.venv`, caches (not the HF model cache) |
+
+### Testing
+
+```bash
+make test
+```
+
+Runs both suites and fails if either fails:
+
+- **Swift** — Swift Testing under `app/`. On Command Line Tools–only Macs (no full Xcode), `Testing.framework` is not on `swift test`’s default search path; `make test` sets the developer Frameworks/library paths automatically when that framework is present.
+- **Python** — `uv run python -m unittest discover -s tests -v` in `server/` (after `make server`).
 
 ### Smoke test (two-terminal alternative)
 
@@ -88,9 +144,11 @@ uv run python scripts/ws_smoke.py test.wav
 
 **Secure input** — Password fields and some elevated prompts enable Secure Input; synthetic keystrokes are dropped. The app refuses to start dictation and warns you. Click out of the secure field and retry.
 
-**Server restarting** — The app restarts `local-dictation-serve` on crash with backoff. Check Console / menu-bar error state, or run the binary by hand to see stderr. Confirm `make server` created `server/.venv/bin/local-dictation-serve`.
+**Server failed / restarting** — Use **Show Server Details…** (and Copy Details) for the launch command, port, exit facts, and recent stderr. **Retry Server** after fixing the underlying problem (override path, port conflict, `make server`, etc.). In development, confirm `make server` created `server/.venv/bin/local-dictation-serve`.
 
-**Model download on first run** — Without `make model`, the first server start downloads ~3.5 GB from Hugging Face. The menu bar shows a downloading state while progress lines appear on stderr. Prefer `make model` beforehand on a good network.
+**Port already in use** — Stop the other process on the configured port, or change `port` in `config.json` and relaunch. The app probes the port before spawning and maps a child `port_in_use` sentinel the same way.
+
+**Model download on first run** — Without `make model`, the first server start downloads ~3.5 GB from Hugging Face. The menu shows Downloading while recognized progress lines appear; silence (or the absolute cap) times out with details. Prefer `make model` beforehand.
 
 **Mic key still opens system Dictation** — Remap not installed, or Dictation shortcut still on. Run `make remap` (or use the app menu), set Shortcut → Off, and grant Input Monitoring if `hidutil` fails on macOS 15+.
 

@@ -1,7 +1,8 @@
 # local-dictation — build, run, remap, smoke
 #
-# The Swift app supervises the Python server itself (spawns
-# server/.venv/bin/local-dictation-serve). `make run` only launches the app.
+# The Swift app supervises the Python server itself (resolves a launch command
+# at startup — typically server/.venv/bin/local-dictation-serve in development).
+# `make run` only launches the app.
 
 ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 APP_DIR := $(ROOT)/app
@@ -12,7 +13,13 @@ SMOKE_WAV := $(SERVER_DIR)/test.wav
 SMOKE_PORT := 8471
 MODEL := mlx-community/Voxtral-Mini-4B-Realtime-6bit
 
-.PHONY: server app run model remap unremap smoke lint clean help
+# Swift Testing lives under the active developer dir; CLT-only machines need
+# explicit framework/library paths (plain `swift test` cannot find Testing).
+DEV := $(shell xcode-select -p)
+TEST_FW := $(DEV)/Library/Developer/Frameworks
+TEST_LIB := $(DEV)/Library/Developer/usr/lib
+
+.PHONY: server app run model remap unremap smoke test lint clean help
 
 help:
 	@echo "Targets:"
@@ -23,6 +30,7 @@ help:
 	@echo "  remap   - remap mic key (🎤) → F13 via hidutil"
 	@echo "  unremap - clear UserKeyMapping"
 	@echo "  smoke   - generate test WAV, start server briefly, run ws_smoke"
+	@echo "  test    - Swift tests (app/) + Python unittest (server/tests/)"
 	@echo "  lint    - ruff check + format --check + ty check"
 	@echo "  clean   - remove build artifacts and venv"
 
@@ -98,6 +106,23 @@ smoke: server
 #   Terminal A: server/.venv/bin/local-dictation-serve --port 8471
 #   Terminal B: cd server && uv run python scripts/make_test_wav.py test.wav \
 #                && uv run python scripts/ws_smoke.py test.wav
+
+# Swift (Swift Testing) + Python (stdlib unittest). Fails if either suite fails.
+test: server
+	@echo "==> Swift tests (app/)"
+	@if [ -d "$(TEST_FW)/Testing.framework" ]; then \
+	  cd $(APP_DIR) && \
+	  DYLD_FRAMEWORK_PATH="$(TEST_FW)" DYLD_LIBRARY_PATH="$(TEST_LIB)" \
+	  swift test \
+	    -Xswiftc -F -Xswiftc "$(TEST_FW)" \
+	    -Xlinker -F -Xlinker "$(TEST_FW)" \
+	    -Xlinker -rpath -Xlinker "$(TEST_FW)" \
+	    -Xlinker -rpath -Xlinker "$(TEST_LIB)"; \
+	else \
+	  cd $(APP_DIR) && swift test; \
+	fi
+	@echo "==> Python tests (server/tests/)"
+	cd $(SERVER_DIR) && uv run python -m unittest discover -s tests -v
 
 lint: server
 	cd $(SERVER_DIR) && uv run ruff check src/ scripts/
