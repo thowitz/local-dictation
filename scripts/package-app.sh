@@ -18,10 +18,52 @@ APP_STAGE="$STAGE/LocalDictation.app"
 CONTENTS="$APP_STAGE/Contents"
 
 PYTHON_VERSION="3.13.13"
-CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
 
 log() { echo "==> $*"; }
 die() { echo "error: $*" >&2; exit 1; }
+
+# --- Code-signing identity resolution --------------------------------------
+# Launch at Login (SMAppService.mainApp) only persists when the app carries a
+# *stable* code signature. An ad-hoc signature ("-") changes on every build, so
+# backgroundtaskmanagementd can never re-match its stored login-item record and
+# the toggle silently resets to .notFound. Resolution order:
+#   1. CODESIGN_IDENTITY set to a non-empty value  -> honored verbatim ("-"
+#      forces ad-hoc; a "Developer ID Application: …" name works here too). An
+#      empty value is treated as unset and falls through to auto-detect below.
+#   2. A self-signed cert named "$SIGNING_IDENTITY_NAME" in the keychain -> sign
+#      by its SHA-1 (hash form needs no trust/policy validation to sign).
+#   3. Otherwise ad-hoc "-" with a loud warning.
+SIGNING_IDENTITY_NAME="${SIGNING_IDENTITY_NAME:-Local Dictation Signing}"
+BUNDLE_ID="com.omcdowell.LocalDictation"
+# Only the auto-detected self-signed path pins an explicit designated
+# requirement; env overrides (ad-hoc or Developer ID) keep codesign's default.
+APPLY_DESIGNATED_REQ=false
+
+if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
+  CODESIGN_SOURCE="environment override"
+else
+  # `security find-certificate` exits 44 when the cert is absent; under
+  # `set -o pipefail` that would abort the script, so tolerate it explicitly.
+  _auto_sha="$(security find-certificate -c "$SIGNING_IDENTITY_NAME" -Z 2>/dev/null \
+    | awk '/SHA-1 hash:/ {print $NF; exit}')" || true
+  if [[ -n "$_auto_sha" ]]; then
+    CODESIGN_IDENTITY="$_auto_sha"
+    CODESIGN_SOURCE="self-signed \"$SIGNING_IDENTITY_NAME\""
+    APPLY_DESIGNATED_REQ=true
+  else
+    CODESIGN_IDENTITY="-"
+    CODESIGN_SOURCE="ad-hoc (no stable identity found)"
+  fi
+fi
+
+# CN-anchored designated requirement: survives regenerating the cert under the
+# same name, so existing Launch-at-Login registrations stay valid across rebuilds.
+DESIGNATED_REQ="designated => identifier \"$BUNDLE_ID\" and certificate leaf[subject.CN] = \"$SIGNING_IDENTITY_NAME\""
+
+if [[ "$CODESIGN_IDENTITY" == "-" ]]; then
+  log "WARNING: signing ad-hoc — Launch at Login will NOT persist across rebuilds."
+  log "         Run 'make signing-identity' (scripts/create-signing-identity.sh) for a durable build."
+fi
 
 # --- Preflight -------------------------------------------------------------
 
@@ -266,7 +308,7 @@ done < <(find "$APP_STAGE" -type l -print0)
 
 # --- 10: sign inner-first, then outer; never --deep to sign ----------------
 
-log "Code-signing nested Mach-O binaries under Helpers/LocalDictationServer.bundle (identity: $CODESIGN_IDENTITY)"
+log "Code-signing nested Mach-O binaries under Helpers/LocalDictationServer.bundle ($CODESIGN_SOURCE)"
 while IFS= read -r -d '' macho; do
   codesign --force --sign "$CODESIGN_IDENTITY" "$macho"
 done < <(find_macho_files "$RUNTIME_ROOT")
@@ -277,8 +319,17 @@ codesign --force --sign "$CODESIGN_IDENTITY" "$RUNTIME_ROOT"
 log "Code-signing main executable"
 codesign --force --sign "$CODESIGN_IDENTITY" "$CONTENTS/MacOS/LocalDictation"
 
-log "Code-signing outer app bundle"
-codesign --force --sign "$CODESIGN_IDENTITY" "$APP_STAGE"
+# Outer bundle carries the identity SMAppService reads. Pin the CN-anchored
+# designated requirement only for the auto-detected self-signed identity; an
+# ad-hoc "-" can't satisfy a certificate requirement, and an env-supplied
+# Developer ID should keep codesign's own (correct) default requirement.
+if [[ "$APPLY_DESIGNATED_REQ" == true ]]; then
+  log "Code-signing outer app bundle (designated requirement pinned to \"$SIGNING_IDENTITY_NAME\")"
+  codesign --force --sign "$CODESIGN_IDENTITY" -r="$DESIGNATED_REQ" "$APP_STAGE"
+else
+  log "Code-signing outer app bundle"
+  codesign --force --sign "$CODESIGN_IDENTITY" "$APP_STAGE"
+fi
 
 log "Verifying outer signature (no --deep; per-Mach-O coverage is in verify-package.sh)"
 codesign --verify --strict --verbose=2 "$APP_STAGE"
@@ -301,5 +352,10 @@ echo "==================================================================="
 echo "Packaged app:      $DIST_APP"
 echo "Size:               $PACKAGE_SIZE"
 echo "Bundled Python:     $PYTHON_VERSION_OUTPUT"
-echo "Codesign identity:  $CODESIGN_IDENTITY"
+echo "Codesign identity:  $CODESIGN_IDENTITY ($CODESIGN_SOURCE)"
+if [[ "$APPLY_DESIGNATED_REQ" == true ]]; then
+  echo "Designated req:     leaf CN = \"$SIGNING_IDENTITY_NAME\" (Launch at Login persists)"
+elif [[ "$CODESIGN_IDENTITY" == "-" ]]; then
+  echo "Designated req:     ad-hoc — Launch at Login will NOT persist (run 'make signing-identity')"
+fi
 echo "==================================================================="

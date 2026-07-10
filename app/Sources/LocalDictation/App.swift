@@ -83,6 +83,7 @@ enum DictationState: Equatable, Sendable {
 // MARK: - Persisted prefs
 
 private enum AppPrefs {
+    /// Legacy key retained for migration awareness; must not satisfy setup completion.
     static let firstRunChecksCompleted = "firstRunChecksCompleted"
     static let playSoundsEnabled = "playSoundsEnabled"
     static let micKeyMode = MicKeyMode.preferenceKey
@@ -725,11 +726,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var controller: DictationController!
     private var config: AppConfig = .load()
     private let micKeyManager = MicKeyManager()
+    private var setupPreferences: SetupPreferences!
+    private var onboardingCoordinator: OnboardingCoordinator!
+    private var onboardingWindowController: OnboardingWindowController!
+    private var remapHealthMonitor: RemapHealthMonitor!
+    private var workspaceObservers: [NSObjectProtocol] = []
 
     private var startStopItem: NSMenuItem!
     private var launchAtLoginItem: NSMenuItem!
     private var playSoundsItem: NSMenuItem!
-    private var installRemapItem: NSMenuItem!
+    private var setupChecklistItem: NSMenuItem!
     private var removeRemapItem: NSMenuItem!
     private var micKeyModeItem: NSMenuItem!
     private var holdToTalkModeItem: NSMenuItem!
@@ -771,6 +777,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             defaults.set(true, forKey: AppPrefs.playSoundsEnabled)
         }
         IndicatorSounds.shared.enabled = defaults.bool(forKey: AppPrefs.playSoundsEnabled)
+
+        setupPreferences = SetupPreferences()
+        onboardingCoordinator = OnboardingCoordinator(
+            preferences: setupPreferences,
+            dependencies: .production(micKeyManager: micKeyManager)
+        )
+        onboardingWindowController = OnboardingWindowController(coordinator: onboardingCoordinator)
+        remapHealthMonitor = RemapHealthMonitor(
+            dependencies: RemapHealthMonitor.Dependencies(
+                sleep: { try await Task.sleep(for: $0) },
+                now: { Date() },
+                expectedActive: { [weak self] in self?.setupPreferences.expectedActive ?? false },
+                persistenceDesired: { [weak self] in self?.setupPreferences.persistenceDesired ?? true },
+                remapStatus: { [weak self] in self?.micKeyManager.remapStatus() ?? .missing },
+                launchAgentStatus: { [weak self] in self?.micKeyManager.launchAgentStatus() ?? .absent },
+                isMutationInProgress: { [weak self] in self?.onboardingCoordinator.mutationInProgress ?? false },
+                isSetupVisibleAndIncomplete: { [weak self] in
+                    guard let self else { return false }
+                    // Suppress recovery modal whenever the setup window is visible.
+                    // Live checklist state is the recovery UI; do not use historical completion.
+                    return self.onboardingWindowController.isVisible
+                }
+            )
+        )
+        remapHealthMonitor.onIssue = { [weak self] issue in
+            self?.presentRemapHealthIssue(issue)
+        }
 
         controller = DictationController(config: config)
         controller.onStateChange = { [weak self] state in
@@ -834,13 +867,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        installRemapItem = NSMenuItem(
-            title: "Install mic-key remap…",
-            action: #selector(installMicKeyRemap),
+        setupChecklistItem = NSMenuItem(
+            title: "Setup Checklist…",
+            action: #selector(showSetupChecklist),
             keyEquivalent: ""
         )
-        installRemapItem.target = self
-        menu.addItem(installRemapItem)
+        setupChecklistItem.target = self
+        menu.addItem(setupChecklistItem)
 
         removeRemapItem = NSMenuItem(
             title: "Remove mic-key remap",
@@ -889,13 +922,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        micPermissionItem = NSMenuItem(title: "Microphone: …", action: nil, keyEquivalent: "")
-        micPermissionItem.isEnabled = false
+        micPermissionItem = NSMenuItem(
+            title: "Microphone: …",
+            action: #selector(showSetupChecklist),
+            keyEquivalent: ""
+        )
+        micPermissionItem.target = self
         menu.addItem(micPermissionItem)
 
         axPermissionItem = NSMenuItem(
             title: "Accessibility: …",
-            action: #selector(promptAccessibilityPermission),
+            action: #selector(showSetupChecklist),
             keyEquivalent: ""
         )
         axPermissionItem.target = self
@@ -924,14 +961,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshRemapItems()
         refreshUI(for: .idle)
 
-        // Request mic access early so the permission row updates.
-        Task { @MainActor in
-            _ = await AudioCapture.requestMicrophoneAccess()
-            self.refreshPermissionRows()
-        }
-
+        registerWorkspaceObservers()
         controller.bootstrap()
-        runFirstRunChecksIfNeeded()
+
+        // Auto-show setup on the next run-loop turn until complete.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if self.setupPreferences.shouldAutoShowSetup {
+                OnboardingLog.logger.info("Auto-showing setup checklist (incomplete)")
+                self.onboardingWindowController.show()
+            }
+            if self.setupPreferences.expectedActive {
+                self.remapHealthMonitor.scheduleLaunchCheck()
+            }
+        }
         AppLog.general.info("LocalDictation launched")
     }
 
@@ -939,86 +982,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         controller.toggleDictation()
     }
 
-    @objc private func installMicKeyRemap() {
-        let result = micKeyManager.installRemap()
-        switch result {
-        case .installed:
-            do {
-                try micKeyManager.installLaunchAgent()
-            } catch {
-                AppLog.general.error(
-                    "LaunchAgent install failed: \(error.localizedDescription, privacy: .public)"
-                )
-                let alert = NSAlert()
-                alert.messageText = "Mic-key remap installed"
-                alert.informativeText =
-                    "The remap is active for this session, but the LaunchAgent could not be installed "
-                    + "(\(error.localizedDescription)). It will not survive reboot until fixed."
-                alert.alertStyle = .warning
-                alert.addButton(withTitle: "OK")
-                alert.runModal()
-                refreshRemapItems()
-                return
-            }
-            let mode = MicKeyMode.read(from: AppIdentity.defaults)
-            let micBehavior: String
-            switch mode {
-            case .holdToTalk:
-                micBehavior = "Hold 🎤 to talk (release to stop)."
-            case .toggle:
-                micBehavior = "Press 🎤 to toggle dictation."
-            }
-            let alert = NSAlert()
-            alert.messageText = "Mic-key remap installed"
-            alert.informativeText =
-                "The 🎤 key now sends F13 and will be re-applied at login. "
-                + micBehavior
-                + " ⌥⌘D remains a toggle shortcut."
-            alert.alertStyle = .informational
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
-
-        case .needsInputMonitoring(let guidance):
-            let alert = NSAlert()
-            alert.messageText = "Input Monitoring required"
-            alert.informativeText = guidance.userGuidance
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "Open Input Monitoring")
-            alert.addButton(withTitle: "Cancel")
-            if alert.runModal() == .alertFirstButtonReturn {
-                NSWorkspace.shared.open(guidance.settingsURL)
-            }
-
-        case .failed(let message):
-            let alert = NSAlert()
-            alert.messageText = "Mic-key remap failed"
-            alert.informativeText = message
-            alert.alertStyle = .critical
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
-        }
+    @objc private func showSetupChecklist() {
+        onboardingCoordinator.openSetupChecklist()
+        onboardingWindowController.show()
+        refreshPermissionRows()
         refreshRemapItems()
     }
 
     @objc private func removeMicKeyRemap() {
-        do {
-            try micKeyManager.removeRemap()
-            try micKeyManager.removeLaunchAgent()
-            let alert = NSAlert()
-            alert.messageText = "Mic-key remap removed"
-            alert.informativeText = "The 🎤 key is restored to system behavior."
-            alert.alertStyle = .informational
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
-        } catch {
+        onboardingCoordinator.removeMicKeyRemap()
+        if let error = onboardingCoordinator.snapshot.actionError {
             let alert = NSAlert()
             alert.messageText = "Could not remove mic-key remap"
-            alert.informativeText = error.localizedDescription
+            alert.informativeText = error
             alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        } else {
+            let alert = NSAlert()
+            alert.messageText = "Mic-key remap removed"
+            alert.informativeText =
+                "The 🎤 key is restored to system behavior. Future restore prompts are suppressed until you install again."
+            alert.alertStyle = .informational
             alert.addButton(withTitle: "OK")
             alert.runModal()
         }
         refreshRemapItems()
+        refreshPermissionRows()
     }
 
     @objc private func togglePlaySounds() {
@@ -1056,29 +1046,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func promptAccessibilityPermission() {
-        if AXIsProcessTrusted() {
-            refreshPermissionRows()
-            return
-        }
-        // String key avoids Swift 6 concurrency complaint on the global CFStringRef var.
-        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
-        let alert = NSAlert()
-        alert.messageText = "Accessibility permission"
-        alert.informativeText =
-            "Local Dictation needs Accessibility to locate the caret and insert text. "
-            + "Enable it in System Settings → Privacy & Security → Accessibility, then reopen the app if needed."
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Open Accessibility Settings")
-        alert.addButton(withTitle: "OK")
-        if alert.runModal() == .alertFirstButtonReturn {
-            if let url = URL(
-                string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility"
-            ) {
-                NSWorkspace.shared.open(url)
-            }
-        }
-        refreshPermissionRows()
+        showSetupChecklist()
     }
 
     @objc private func toggleLaunchAtLogin() {
@@ -1094,16 +1062,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             switch service.status {
             case .enabled:
                 try service.unregister()
-            case .notRegistered:
+            case .notRegistered, .notFound:
+                // .notFound is not a dead end: on several macOS versions a valid,
+                // never-registered app reports .notFound rather than .notRegistered
+                // (and it also appears after the system drops an orphaned record).
+                // Treat it like .notRegistered and attempt registration; the catch
+                // below surfaces the real reason if the system genuinely refuses.
                 try service.register()
             case .requiresApproval:
                 SMAppService.openSystemSettingsLoginItems()
-            case .notFound:
-                presentLaunchAtLoginAlert(
-                    message: "Launch at Login is unavailable",
-                    informative:
-                        "macOS could not find this app’s login-item registration. Reinstall Local Dictation into /Applications, relaunch that copy, and try again."
-                )
             @unknown default:
                 presentLaunchAtLoginAlert(
                     message: "Launch at Login",
@@ -1111,21 +1078,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 )
             }
         } catch {
-            AppLog.general.error("Launch at login failed: \(error.localizedDescription, privacy: .public)")
+            let nsError = error as NSError
+            AppLog.general.error(
+                "Launch at login failed: \(error.localizedDescription, privacy: .public) [\(nsError.domain, privacy: .public) \(nsError.code, privacy: .public)]"
+            )
             presentLaunchAtLoginAlert(
-                message: "Launch at Login",
-                informative: "Couldn't update login item: \(error.localizedDescription)"
+                message: "Launch at Login couldn’t be enabled",
+                informative:
+                    "The system refused the login-item registration:\n\n\(error.localizedDescription) (\(nsError.domain) \(nsError.code))\n\nIf this persists, the app likely needs a signing identity the system trusts."
             )
         }
         refreshLaunchAtLoginItem()
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        onboardingCoordinator.refresh()
         refreshLaunchAtLoginItem()
         refreshPermissionRows()
         refreshRemapItems()
         refreshPlaySoundsItem()
         refreshMicKeyModeItems()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        onboardingCoordinator.refresh()
+        refreshPermissionRows()
+        refreshRemapItems()
     }
 
     private func presentLaunchAtLoginInstallGuidance() {
@@ -1149,6 +1127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggleHotKey.unregister()
         f13HotKey.unregister()
         micKeyInterpreter.reset()
+        teardownOnboardingLifecycle()
         controller.shutdown()
         NSApp.terminate(nil)
     }
@@ -1157,51 +1136,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggleHotKey.unregister()
         f13HotKey.unregister()
         micKeyInterpreter.reset()
+        teardownOnboardingLifecycle()
         controller?.shutdown()
     }
 
-    private func runFirstRunChecksIfNeeded() {
-        let defaults = AppIdentity.defaults
-        guard !defaults.bool(forKey: AppPrefs.firstRunChecksCompleted) else { return }
-        defaults.set(true, forKey: AppPrefs.firstRunChecksCompleted)
+    private func registerWorkspaceObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        let wake = center.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.remapHealthMonitor.scheduleWakeOrSessionCheck()
+            }
+        }
+        let session = center.addObserver(
+            forName: NSWorkspace.sessionDidBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.remapHealthMonitor.scheduleWakeOrSessionCheck()
+            }
+        }
+        workspaceObservers = [wake, session]
+    }
 
-        let report = FirstRunChecks.evaluate()
-        guard report.needsUserAttention else { return }
+    private func teardownOnboardingLifecycle() {
+        remapHealthMonitor?.cancel()
+        let center = NSWorkspace.shared.notificationCenter
+        for observer in workspaceObservers {
+            center.removeObserver(observer)
+        }
+        workspaceObservers.removeAll()
+    }
 
+    private func presentRemapHealthIssue(_ issue: RemapHealthIssue) {
         let alert = NSAlert()
-        alert.messageText = "Turn off system Dictation / Siri shortcuts"
-        var lines: [String] = [
-            "So the 🎤 key reaches Local Dictation instead of macOS:",
-            "",
-        ]
-        switch report.dictationShortcut {
-        case .enabled:
-            lines.append("• Keyboard → Dictation → Shortcut appears enabled — set it to Off.")
-        case .unknown:
-            lines.append("• Keyboard → Dictation → Shortcut — confirm it is Off.")
-        case .disabled:
-            break
+        switch issue.outcome {
+        case .activeButPersistenceNeedsRepair:
+            alert.messageText = "Mic-key remap persistence needs repair"
+            alert.informativeText =
+                "The 🎤 → F13 mapping is active, but login persistence is missing or invalid."
+            alert.addButton(withTitle: "Repair Persistence")
+        case .expectedMappingMissing:
+            alert.messageText = "Mic-key remap missing"
+            alert.informativeText =
+                "Local Dictation expects the 🎤 → F13 mapping, but it is not active."
+            alert.addButton(withTitle: "Restore Now")
+        case .healthy, .noExpectation, .probeFailed:
+            remapHealthMonitor.notePromptDismissed()
+            return
         }
-        switch report.siriHoldF5 {
-        case .enabled, .unknown:
-            lines.append(
-                "• Apple Intelligence & Siri — turn off press-and-hold for Siri if it uses F5 / the mic key."
-            )
-        case .disabled:
-            break
-        }
-        alert.informativeText = lines.joined(separator: "\n")
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "Open Dictation Settings")
-        alert.addButton(withTitle: "Open Siri Settings")
-        alert.addButton(withTitle: "Later")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Open Setup")
+        alert.addButton(withTitle: "Not Now")
+
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            FirstRunChecks.openDictationSettings()
+            let restored = onboardingCoordinator.restoreExpectedRemap()
+            refreshRemapItems()
+            remapHealthMonitor.notePromptDismissed()
+            if !restored {
+                // Surface actionable restore/repair failure in the setup checklist.
+                showSetupChecklist()
+            }
         case .alertSecondButtonReturn:
-            FirstRunChecks.openSiriSettings()
+            remapHealthMonitor.notePromptDismissed()
+            showSetupChecklist()
         default:
-            break
+            remapHealthMonitor.noteNotNow()
         }
     }
 
@@ -1301,7 +1306,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshPermissionRows() {
-        let micStatus = AudioCapture.microphoneAuthorizationStatus()
+        onboardingCoordinator?.refresh()
+        let micStatus = onboardingCoordinator?.snapshot.microphone
+            ?? SetupMicrophoneStatus.from(AudioCapture.microphoneAuthorizationStatus())
         let micText: String
         switch micStatus {
         case .authorized:
@@ -1310,24 +1317,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             micText = "Microphone: Denied"
         case .restricted:
             micText = "Microphone: Restricted"
-        case .notDetermined:
+        case .notRequested:
             micText = "Microphone: Not determined"
-        @unknown default:
+        case .unknown:
             micText = "Microphone: Unknown"
         }
         micPermissionItem.title = micText
+        micPermissionItem.isEnabled = true
+        micPermissionItem.action = #selector(showSetupChecklist)
+        micPermissionItem.target = self
 
-        let trusted = AXIsProcessTrusted()
+        let trusted = onboardingCoordinator?.snapshot.accessibilityTrusted ?? AXIsProcessTrusted()
         if trusted {
             axPermissionItem.title = "Accessibility: Granted"
-            axPermissionItem.isEnabled = false
-            axPermissionItem.action = nil
         } else {
-            axPermissionItem.title = "Accessibility: Not granted — click to grant…"
-            axPermissionItem.isEnabled = true
-            axPermissionItem.action = #selector(promptAccessibilityPermission)
-            axPermissionItem.target = self
+            axPermissionItem.title = "Accessibility: Not granted — open Setup…"
         }
+        axPermissionItem.isEnabled = true
+        axPermissionItem.action = #selector(showSetupChecklist)
+        axPermissionItem.target = self
 
         let secure = TextInserter.isSecureEventInputEnabled()
         if secure {
@@ -1351,15 +1359,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .enabled:
             launchAtLoginItem.title = "Launch at Login"
             launchAtLoginItem.state = .on
-        case .notRegistered:
+        case .notRegistered, .notFound:
+            // .notFound is treated like .notRegistered here to match
+            // toggleLaunchAtLogin(), which registers on click in both states.
             launchAtLoginItem.title = "Launch at Login"
             launchAtLoginItem.state = .off
         case .requiresApproval:
             launchAtLoginItem.title = "Launch at Login (approval required…)"
             launchAtLoginItem.state = .mixed
-        case .notFound:
-            launchAtLoginItem.title = "Launch at Login (unavailable)"
-            launchAtLoginItem.state = .off
         @unknown default:
             launchAtLoginItem.title = "Launch at Login"
             launchAtLoginItem.state = .off
@@ -1377,12 +1384,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshRemapItems() {
-        let remapped = micKeyManager.verifyRemap()
-        let agent = micKeyManager.isLaunchAgentInstalled()
-        installRemapItem.title = (remapped && agent)
-            ? "Reinstall mic-key remap…"
-            : "Install mic-key remap…"
-        removeRemapItem.isEnabled = remapped || agent
+        let status = micKeyManager.remapStatus()
+        let agent = micKeyManager.launchAgentStatus()
+        let remapped = status == .installed
+        let agentPresent: Bool
+        switch agent {
+        case .loaded, .validButUnloaded, .invalid:
+            agentPresent = true
+        case .absent:
+            agentPresent = false
+        }
+        removeRemapItem.isEnabled = remapped || agentPresent || setupPreferences?.expectedActive == true
     }
 }
 

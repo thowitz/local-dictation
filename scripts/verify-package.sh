@@ -130,6 +130,24 @@ MIC_USAGE="$(plist_value "NSMicrophoneUsageDescription")" || die "Info.plist mis
 log "Verifying outer bundle signature (no --deep)"
 codesign --verify --strict --verbose=2 "$APP"
 
+# --- 3b: signing identity / Launch-at-Login persistence (advisory) ----------
+# Not fatal: an ad-hoc build is a valid package, it just can't persist Launch at
+# Login (SMAppService.mainApp keeps resetting to .notFound because the ad-hoc
+# designated requirement is a per-build cdhash). Surface the identity + DR so
+# the persistence property is visible without failing ad-hoc/CI builds.
+
+log "Signing identity (advisory — Launch at Login persistence)"
+SIG_INFO="$(codesign -dvvv "$APP" 2>&1 || true)"
+if grep -q "Signature=adhoc" <<<"$SIG_INFO"; then
+  echo "note: app is AD-HOC signed — Launch at Login will not persist across rebuilds."
+  echo "note: run scripts/create-signing-identity.sh (make signing-identity), then re-package."
+else
+  AUTH_LINE="$(grep -m1 '^Authority=' <<<"$SIG_INFO" || true)"
+  DESIG_REQ="$(codesign -d -r- "$APP" 2>/dev/null | sed -n 's/^designated => //p' || true)"
+  [[ -n "$AUTH_LINE" ]] && echo "signed by: ${AUTH_LINE#Authority=}"
+  [[ -n "$DESIG_REQ" ]] && echo "designated requirement: $DESIG_REQ"
+fi
+
 # --- 4: per Mach-O checks (arch, signature, load paths) ---------------------
 
 log "Checking every Mach-O binary (arch, signature, load paths)"

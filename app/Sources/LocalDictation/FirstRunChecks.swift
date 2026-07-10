@@ -57,31 +57,38 @@ enum FirstRunChecks {
 
     /// Reads public preference domains and returns a conflict report.
     static func evaluate() -> FirstRunCheckReport {
-        let autoEnable = readAppleDictationAutoEnable()
-        let hotKeyEnabled = readSymbolicHotKey164Enabled()
+        evaluate(
+            appleDictationAutoEnable: readAppleDictationAutoEnable(),
+            symbolicHotKey164Enabled: readSymbolicHotKey164Enabled()
+        )
+    }
 
+    /// Pure evaluator for tests and callers that already have preference values.
+    /// Symbolic hotkey 164 takes precedence over `AppleDictationAutoEnable`.
+    /// Siri hold-F5 has no stable public probe and remains `.unknown` unless a
+    /// future caller supplies an explicit disabled/enabled override.
+    static func evaluate(
+        appleDictationAutoEnable: Int?,
+        symbolicHotKey164Enabled: Bool?,
+        siriHoldF5: SystemShortcutStatus = .unknown
+    ) -> FirstRunCheckReport {
         let dictation: SystemShortcutStatus = {
             // Prefer the explicit Shortcut toggle when present.
-            if let hotKeyEnabled {
-                return hotKeyEnabled ? .enabled : .disabled
+            if let symbolicHotKey164Enabled {
+                return symbolicHotKey164Enabled ? .enabled : .disabled
             }
             // Fallback: AppleDictationAutoEnable — 0 means "Don't Ask Again" / Off.
-            if let autoEnable {
-                return autoEnable == 0 ? .disabled : .enabled
+            if let appleDictationAutoEnable {
+                return appleDictationAutoEnable == 0 ? .disabled : .enabled
             }
             return .unknown
         }()
 
-        // Siri's "Press and hold" / F5 binding is not exposed via a stable public
-        // defaults key across macOS 15–26. Surface .unknown so the UI still
-        // deep-links the user to confirm the hold-F5 binding is off.
-        let siri: SystemShortcutStatus = .unknown
-
         return FirstRunCheckReport(
             dictationShortcut: dictation,
-            siriHoldF5: siri,
-            appleDictationAutoEnable: autoEnable,
-            symbolicHotKey164Enabled: hotKeyEnabled
+            siriHoldF5: siriHoldF5,
+            appleDictationAutoEnable: appleDictationAutoEnable,
+            symbolicHotKey164Enabled: symbolicHotKey164Enabled
         )
     }
 

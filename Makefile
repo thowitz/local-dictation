@@ -19,7 +19,7 @@ DEV := $(shell xcode-select -p)
 TEST_FW := $(DEV)/Library/Developer/Frameworks
 TEST_LIB := $(DEV)/Library/Developer/usr/lib
 
-.PHONY: server app run model remap unremap smoke test lint package package-check clean help
+.PHONY: server app run model remap unremap smoke test lint signing-identity package package-check clean help
 
 help:
 	@echo "Targets:"
@@ -32,6 +32,7 @@ help:
 	@echo "  smoke          - generate test WAV, start server briefly, run ws_smoke"
 	@echo "  test           - Swift tests (app/) + Python unittest (server/tests/)"
 	@echo "  lint           - ruff check + format --check + ty check"
+	@echo "  signing-identity - create a stable self-signed identity (one-time; needed for Launch at Login)"
 	@echo "  package        - build signed dist/LocalDictation.app (arm64)"
 	@echo "  package-check  - verify dist/LocalDictation.app layout + bundled server"
 	@echo "  clean          - remove build artifacts, package staging, and venv"
@@ -130,6 +131,9 @@ lint: server
 	cd $(SERVER_DIR) && uv run ruff check src/ scripts/
 	cd $(SERVER_DIR) && uv run ruff format --check src/ scripts/
 	cd $(SERVER_DIR) && uv run ty check src/
+
+signing-identity:
+	"$(ROOT)/scripts/create-signing-identity.sh"
 
 package:
 	"$(ROOT)/scripts/package-app.sh"

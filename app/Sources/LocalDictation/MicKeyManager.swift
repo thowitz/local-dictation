@@ -29,6 +29,21 @@ enum MicKeyRemapResult: Equatable, Sendable {
     case failed(String)
 }
 
+/// Authoritative non-mutating remap probe result.
+enum MicKeyRemapStatus: Equatable, Sendable {
+    case installed
+    case missing
+    case probeFailed(String)
+}
+
+/// App-owned LaunchAgent health for `com.local-dictation.keyremap`.
+enum LaunchAgentStatus: Equatable, Sendable {
+    case absent
+    case invalid(String)
+    case validButUnloaded
+    case loaded
+}
+
 /// Copy + deep-link for the Input Monitoring grant prompt.
 struct MicKeyInputMonitoringGuidance: Equatable, Sendable {
     /// Human-readable instruction for an alert / menu row.
@@ -44,12 +59,19 @@ struct MicKeyInputMonitoringGuidance: Equatable, Sendable {
             userGuidance:
                 "Grant Input Monitoring to \(displayName) in Privacy & Security, then retry. "
                 + "On macOS 15+, hidutil silently fails to apply UserKeyMapping without it.",
-            settingsURL: URL(
-                string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ListenEvent"
-            )!
+            settingsURL: SystemSettingsLinks.inputMonitoringURL
         )
     }
 }
+
+/// Narrow injectable runner for hidutil / launchctl probes and mutations.
+struct MicKeyProcessResult: Equatable, Sendable {
+    var terminationStatus: Int32
+    var stdout: String
+    var stderr: String
+}
+
+typealias MicKeyProcessRunner = @Sendable (_ path: String, _ arguments: [String]) throws -> MicKeyProcessResult
 
 /// Remaps the hardware 🎤 / Voice Command key to F13 and persists that remap
 /// via a LaunchAgent. Hotkey registration is owned by `CarbonHotKey` in App.swift.
@@ -58,22 +80,42 @@ final class MicKeyManager {
     // MARK: HID / LaunchAgent constants
 
     /// Consumer Page 0x0C usage 0xCF ("Voice Command") — the F5 mic key.
-    static let micKeyHIDUsage: UInt64 = 0xC000000CF
+    nonisolated static let micKeyHIDUsage: UInt64 = 0xC000000CF
     /// Keyboard page usage for F13.
-    static let f13HIDUsage: UInt64 = 0x700000068
+    nonisolated static let f13HIDUsage: UInt64 = 0x700000068
     /// Carbon virtual key code for F13 (`kVK_F13`).
-    static let f13KeyCode: UInt32 = 105
-    static let launchAgentLabel = "com.local-dictation.keyremap"
-    static let hidutilPath = "/usr/bin/hidutil"
+    nonisolated static let f13KeyCode: UInt32 = 105
+    nonisolated static let launchAgentLabel = "com.local-dictation.keyremap"
+    nonisolated static let hidutilPath = "/usr/bin/hidutil"
+    nonisolated static let launchctlPath = "/bin/launchctl"
 
     private static let log = Logger(
         subsystem: AppLog.subsystem,
         category: "MicKeyManager"
     )
 
-    private static let remapJSON =
+    nonisolated static let remapJSON =
         #"{"UserKeyMapping":[{"HIDKeyboardModifierMappingSrc":0xC000000CF,"HIDKeyboardModifierMappingDst":0x700000068}]}"#
     private static let clearJSON = #"{"UserKeyMapping":[]}"#
+
+    private let runProcess: MicKeyProcessRunner
+    private let fileManager: FileManager
+    private let homeDirectory: () -> URL
+    private let currentUID: () -> uid_t
+
+    init(
+        runProcess: @escaping MicKeyProcessRunner = { path, arguments in
+            try MicKeyManager.runProcessUnisolated(path: path, arguments: arguments)
+        },
+        fileManager: FileManager = .default,
+        homeDirectory: @escaping () -> URL = { FileManager.default.homeDirectoryForCurrentUser },
+        currentUID: @escaping () -> uid_t = { getuid() }
+    ) {
+        self.runProcess = runProcess
+        self.fileManager = fileManager
+        self.homeDirectory = homeDirectory
+        self.currentUID = currentUID
+    }
 
     // MARK: - Remap (hidutil)
 
@@ -87,13 +129,16 @@ final class MicKeyManager {
             return .failed(error.localizedDescription)
         }
 
-        if verifyRemap() {
+        switch remapStatus() {
+        case .installed:
             return .installed
+        case .missing:
+            let guidance = MicKeyInputMonitoringGuidance.forCurrentApp()
+            Self.log.error("UserKeyMapping missing after set — likely needs Input Monitoring")
+            return .needsInputMonitoring(guidance: guidance)
+        case .probeFailed(let message):
+            return .failed(message)
         }
-
-        let guidance = MicKeyInputMonitoringGuidance.forCurrentApp()
-        Self.log.error("UserKeyMapping missing after set — likely needs Input Monitoring")
-        return .needsInputMonitoring(guidance: guidance)
     }
 
     /// Clears all `UserKeyMapping` entries (restores stock mic-key behavior).
@@ -101,16 +146,32 @@ final class MicKeyManager {
         _ = try runHidutil(arguments: ["property", "--set", Self.clearJSON])
     }
 
-    /// Returns `true` when our mic→F13 mapping is present in `UserKeyMapping`.
-    func verifyRemap() -> Bool {
+    /// Authoritative remap probe. Distinguishes missing from probe failure.
+    func remapStatus() -> MicKeyRemapStatus {
         let output: String
         do {
             output = try runHidutil(arguments: ["property", "--get", "UserKeyMapping"])
         } catch {
             Self.log.error("hidutil get failed: \(error.localizedDescription, privacy: .public)")
-            return false
+            return .probeFailed(error.localizedDescription)
         }
-        return Self.userKeyMappingContainsOurRemap(output)
+        guard let entries = Self.parseUserKeyMappingEntries(output) else {
+            Self.log.error("UserKeyMapping output unreadable")
+            return .probeFailed("Unreadable UserKeyMapping output")
+        }
+        for entry in entries {
+            let src = Self.uint64(from: entry["HIDKeyboardModifierMappingSrc"])
+            let dst = Self.uint64(from: entry["HIDKeyboardModifierMappingDst"])
+            if src == Self.micKeyHIDUsage && dst == Self.f13HIDUsage {
+                return .installed
+            }
+        }
+        return .missing
+    }
+
+    /// Returns `true` when our mic→F13 mapping is present in `UserKeyMapping`.
+    func verifyRemap() -> Bool {
+        remapStatus() == .installed
     }
 
     /// Install + verify in one call (alias of `installRemap()` for call-site clarity).
@@ -122,7 +183,7 @@ final class MicKeyManager {
     // MARK: - LaunchAgent persistence
 
     var launchAgentPlistURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
+        homeDirectory()
             .appendingPathComponent("Library/LaunchAgents", isDirectory: true)
             .appendingPathComponent("\(Self.launchAgentLabel).plist", isDirectory: false)
     }
@@ -130,9 +191,8 @@ final class MicKeyManager {
     /// Writes `~/Library/LaunchAgents/com.local-dictation.keyremap.plist` and
     /// bootstraps it for the current GUI session (`RunAtLoad`).
     func installLaunchAgent() throws {
-        let fm = FileManager.default
         let dir = launchAgentPlistURL.deletingLastPathComponent()
-        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
 
         let plist: [String: Any] = [
             "Label": Self.launchAgentLabel,
@@ -151,81 +211,182 @@ final class MicKeyManager {
         )
         try data.write(to: launchAgentPlistURL, options: .atomic)
 
-        let uid = getuid()
+        let uid = currentUID()
         let domain = "gui/\(uid)"
         // bootout first so re-install is idempotent (ignore failure if not loaded).
-        _ = try? runProcess(
-            path: "/bin/launchctl",
+        _ = try? runCheckedProcess(
+            path: Self.launchctlPath,
             arguments: ["bootout", "\(domain)/\(Self.launchAgentLabel)"]
         )
-        _ = try runProcess(
-            path: "/bin/launchctl",
+        _ = try runCheckedProcess(
+            path: Self.launchctlPath,
             arguments: ["bootstrap", domain, launchAgentPlistURL.path]
         )
+
+        switch launchAgentStatus() {
+        case .loaded:
+            return
+        case .absent:
+            throw MicKeyManagerError.persistenceUnhealthy("LaunchAgent plist missing after install")
+        case .invalid(let reason):
+            throw MicKeyManagerError.persistenceUnhealthy(reason)
+        case .validButUnloaded:
+            throw MicKeyManagerError.persistenceUnhealthy(
+                "LaunchAgent plist is valid but not loaded in launchd"
+            )
+        }
     }
 
     /// Boots out the agent and deletes the plist.
     func removeLaunchAgent() throws {
-        let uid = getuid()
+        let uid = currentUID()
         let domain = "gui/\(uid)"
-        _ = try? runProcess(
-            path: "/bin/launchctl",
+        _ = try? runCheckedProcess(
+            path: Self.launchctlPath,
             arguments: ["bootout", "\(domain)/\(Self.launchAgentLabel)"]
         )
-        let fm = FileManager.default
-        if fm.fileExists(atPath: launchAgentPlistURL.path) {
-            try fm.removeItem(at: launchAgentPlistURL)
+        if fileManager.fileExists(atPath: launchAgentPlistURL.path) {
+            try fileManager.removeItem(at: launchAgentPlistURL)
         }
     }
 
     func isLaunchAgentInstalled() -> Bool {
-        FileManager.default.fileExists(atPath: launchAgentPlistURL.path)
+        fileManager.fileExists(atPath: launchAgentPlistURL.path)
+    }
+
+    /// Validates the app-owned plist and whether launchd has loaded the job.
+    /// A successful `launchctl print` means loaded even when the one-shot job is not running.
+    func launchAgentStatus() -> LaunchAgentStatus {
+        let url = launchAgentPlistURL
+        guard fileManager.fileExists(atPath: url.path) else {
+            return .absent
+        }
+
+        if let reason = Self.validateLaunchAgentPlist(at: url, fileManager: fileManager) {
+            return .invalid(reason)
+        }
+
+        let uid = currentUID()
+        let domain = "gui/\(uid)"
+        do {
+            let result = try runProcess(
+                Self.launchctlPath,
+                ["print", "\(domain)/\(Self.launchAgentLabel)"]
+            )
+            if result.terminationStatus == 0 {
+                return .loaded
+            }
+            return .validButUnloaded
+        } catch {
+            return .validButUnloaded
+        }
     }
 
     // MARK: - Parsing
 
     /// Accepts both `hidutil` OpenStep-style dumps and JSON.
-    static func userKeyMappingContainsOurRemap(_ output: String) -> Bool {
-        let normalized = output
-            .replacingOccurrences(of: "0x", with: "0x", options: .caseInsensitive)
-            .lowercased()
-
-        let srcHex = String(format: "0x%llx", micKeyHIDUsage)
-        let dstHex = String(format: "0x%llx", f13HIDUsage)
-        let srcDec = String(micKeyHIDUsage)
-        let dstDec = String(f13HIDUsage)
-
-        let hasSrc = normalized.contains(srcHex) || normalized.contains(srcDec)
-        let hasDst = normalized.contains(dstHex) || normalized.contains(dstDec)
-        if hasSrc && hasDst {
-            return true
+    /// Requires source and destination in the same mapping entry.
+    nonisolated static func userKeyMappingContainsOurRemap(_ output: String) -> Bool {
+        guard let entries = parseUserKeyMappingEntries(output) else {
+            return false
         }
-
-        // JSON path: try to decode an array of mapping dicts if present.
-        if let data = output.data(using: .utf8),
-           let json = try? JSONSerialization.jsonObject(with: data) {
-            let mappings: [[String: Any]]
-            if let dict = json as? [String: Any],
-               let arr = dict["UserKeyMapping"] as? [[String: Any]] {
-                mappings = arr
-            } else if let arr = json as? [[String: Any]] {
-                mappings = arr
-            } else {
-                mappings = []
-            }
-            for entry in mappings {
-                let src = Self.uint64(from: entry["HIDKeyboardModifierMappingSrc"])
-                let dst = Self.uint64(from: entry["HIDKeyboardModifierMappingDst"])
-                if src == micKeyHIDUsage && dst == f13HIDUsage {
-                    return true
-                }
+        for entry in entries {
+            let src = uint64(from: entry["HIDKeyboardModifierMappingSrc"])
+            let dst = uint64(from: entry["HIDKeyboardModifierMappingDst"])
+            if src == micKeyHIDUsage && dst == f13HIDUsage {
+                return true
             }
         }
-
         return false
     }
 
-    private static func uint64(from value: Any?) -> UInt64? {
+    /// Parses JSON or OpenStep plist `UserKeyMapping` output into entry dictionaries.
+    /// Returns `nil` when the payload cannot be parsed as a mapping list.
+    nonisolated static func parseUserKeyMappingEntries(_ output: String) -> [[String: Any]]? {
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        if let data = trimmed.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data) {
+            if let dict = json as? [String: Any] {
+                if let arr = dict["UserKeyMapping"] as? [[String: Any]] {
+                    return arr
+                }
+                if dict["HIDKeyboardModifierMappingSrc"] != nil
+                    || dict["HIDKeyboardModifierMappingDst"] != nil
+                {
+                    return [dict]
+                }
+            } else if let arr = json as? [[String: Any]] {
+                return arr
+            }
+        }
+
+        if let data = trimmed.data(using: .utf8),
+           let plist = try? PropertyListSerialization.propertyList(
+            from: data,
+            options: [],
+            format: nil
+           )
+        {
+            if let arr = plist as? [[String: Any]] {
+                return arr
+            }
+            if let dict = plist as? [String: Any] {
+                if let arr = dict["UserKeyMapping"] as? [[String: Any]] {
+                    return arr
+                }
+                if dict["HIDKeyboardModifierMappingSrc"] != nil
+                    || dict["HIDKeyboardModifierMappingDst"] != nil
+                {
+                    return [dict]
+                }
+            }
+            if let arr = plist as? [Any] {
+                return arr.compactMap { $0 as? [String: Any] }
+            }
+        }
+
+        return nil
+    }
+
+    /// Returns a validation failure reason, or `nil` when the plist is app-owned and valid.
+    nonisolated static func validateLaunchAgentPlist(
+        at url: URL,
+        fileManager: FileManager = .default
+    ) -> String? {
+        guard fileManager.fileExists(atPath: url.path) else {
+            return "LaunchAgent plist is missing"
+        }
+        guard let data = try? Data(contentsOf: url),
+              let plist = try? PropertyListSerialization.propertyList(
+                from: data,
+                options: [],
+                format: nil
+              ) as? [String: Any]
+        else {
+            return "LaunchAgent plist is unreadable"
+        }
+
+        guard let label = plist["Label"] as? String, label == launchAgentLabel else {
+            return "LaunchAgent Label must be \(launchAgentLabel)"
+        }
+        guard let runAtLoad = plist["RunAtLoad"] as? Bool, runAtLoad else {
+            return "LaunchAgent RunAtLoad must be true"
+        }
+        guard let args = plist["ProgramArguments"] as? [String],
+              args.count == 4,
+              args[0] == hidutilPath,
+              args[1] == "property",
+              args[2] == "--set",
+              args[3] == remapJSON
+        else {
+            return "LaunchAgent ProgramArguments must run hidutil with the mic→F13 mapping"
+        }
+        return nil
+    }
+
+    nonisolated static func uint64(from value: Any?) -> UInt64? {
         switch value {
         case let n as UInt64:
             return n
@@ -234,11 +395,13 @@ final class MicKeyManager {
         case let n as NSNumber:
             return n.uint64Value
         case let s as String:
-            if s.lowercased().hasPrefix("0x"),
-               let v = UInt64(s.dropFirst(2), radix: 16) {
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.lowercased().hasPrefix("0x"),
+               let v = UInt64(trimmed.dropFirst(2), radix: 16)
+            {
                 return v
             }
-            return UInt64(s)
+            return UInt64(trimmed)
         default:
             return nil
         }
@@ -247,11 +410,24 @@ final class MicKeyManager {
     // MARK: - Process helpers
 
     private func runHidutil(arguments: [String]) throws -> String {
-        try runProcess(path: Self.hidutilPath, arguments: arguments)
+        try runCheckedProcess(path: Self.hidutilPath, arguments: arguments)
     }
 
     @discardableResult
-    private func runProcess(path: String, arguments: [String]) throws -> String {
+    private func runCheckedProcess(path: String, arguments: [String]) throws -> String {
+        let result = try runProcess(path, arguments)
+        guard result.terminationStatus == 0 else {
+            let detail = result.stderr.isEmpty ? result.stdout : result.stderr
+            throw MicKeyManagerError.processFailed(
+                path: path,
+                status: result.terminationStatus,
+                message: detail.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        return result.stdout
+    }
+
+    nonisolated static func runProcessUnisolated(path: String, arguments: [String]) throws -> MicKeyProcessResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
@@ -266,29 +442,25 @@ final class MicKeyManager {
 
         let outData = stdout.fileHandleForReading.readDataToEndOfFile()
         let errData = stderr.fileHandleForReading.readDataToEndOfFile()
-        let out = String(data: outData, encoding: .utf8) ?? ""
-        let err = String(data: errData, encoding: .utf8) ?? ""
-
-        guard process.terminationStatus == 0 else {
-            let detail = err.isEmpty ? out : err
-            throw MicKeyManagerError.processFailed(
-                path: path,
-                status: process.terminationStatus,
-                message: detail.trimmingCharacters(in: .whitespacesAndNewlines)
-            )
-        }
-        return out
+        return MicKeyProcessResult(
+            terminationStatus: process.terminationStatus,
+            stdout: String(data: outData, encoding: .utf8) ?? "",
+            stderr: String(data: errData, encoding: .utf8) ?? ""
+        )
     }
 }
 
 enum MicKeyManagerError: Error, LocalizedError {
     case processFailed(path: String, status: Int32, message: String)
+    case persistenceUnhealthy(String)
 
     var errorDescription: String? {
         switch self {
         case .processFailed(let path, let status, let message):
             let suffix = message.isEmpty ? "" : ": \(message)"
             return "\(path) exited \(status)\(suffix)"
+        case .persistenceUnhealthy(let reason):
+            return reason
         }
     }
 }
