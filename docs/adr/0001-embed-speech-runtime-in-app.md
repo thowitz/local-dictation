@@ -1,0 +1,3 @@
+# Embed the speech runtime in the application bundle
+
+Local Dictation will ship a relocatable CPython runtime and its locked production speech-recognition dependencies inside the macOS application bundle, while keeping the large model in the user’s external Hugging Face cache. This makes the application usable on a clean machine without `uv`, Python, Xcode, or a repository checkout, while avoiding a mutable multi-gigabyte model inside the signed bundle. We rejected requiring developer tooling, installing a runtime sidecar on first launch, and freezing the MLX dependency graph because each weakens clean-machine reliability or makes native MLX resources substantially more fragile.

@@ -1,0 +1,3 @@
+# Separate speech-runtime and dictation-session lifecycles
+
+Local Dictation owns and supervises exactly one speech runtime, which warms on application launch, may unload after inactivity, and is never adopted from an existing listener merely because it answers a health check. Dictation requests and sessions have a separate lifecycle: a request can wait through warm-up, withdrawing a request does not cancel warm-up, and a runtime failure interrupts rather than automatically resumes a session. This separation costs explicit state coordination, but it prevents unknown process ownership, startup churn from brief gestures, and unsafe reconstruction of recognition state after failure.
