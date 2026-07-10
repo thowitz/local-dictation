@@ -160,6 +160,11 @@ final class DictationController {
                             self?.transition(to: .failed(.app(message)))
                         }
                     }
+                },
+                onBufferCleared: { [weak self] in
+                    Task { @MainActor in
+                        self?.handleBufferCleared()
+                    }
                 }
             )
         )
@@ -223,7 +228,7 @@ final class DictationController {
         switch state {
         case .ready:
             intent.queue(startIntent)
-            beginListening()
+            beginListeningIfPendingIntent()
         case .listening, .flushing:
             return
         case .starting, .downloading, .restarting:
@@ -256,7 +261,20 @@ final class DictationController {
         transition(to: .flushing)
         updateIndicatorProcessing()
         audio.stop()
-        realtime.commitFinal()
+        if !realtime.commitFinal() {
+            // Commit could not be enqueued — tear down locally instead of hanging in flushing.
+            AppLog.general.error("commitFinal enqueue failed — tearing down locally")
+            escapeHotKey.unregister()
+            textInserter.discard()
+            sessionTranscript = ""
+            endIndicatorSession(playSound: true)
+            if realtime.isConnected, case .running = supervisor.state {
+                transition(to: .ready)
+            } else {
+                transition(to: .starting)
+            }
+            return
+        }
         AppLog.general.info("Stop dictation — commit final sent")
     }
 
@@ -265,15 +283,21 @@ final class DictationController {
     func cancelDictation() {
         guard state == .listening || state == .flushing else { return }
         intent.clearAll()
-        awaitingBufferClear = false
         escapeHotKey.unregister()
         audio.stop()
         textInserter.discard()
         sessionTranscript = ""
         endIndicatorSession(playSound: true)
-        // Reset server-side session without waiting for a final transcript.
-        realtime.clearBuffer()
-        AppLog.general.info("Dictation cancelled (Esc) — no flush")
+
+        // Quarantine trailing realtime output until the server acks clear.
+        awaitingBufferClear = true
+        if !realtime.clearBuffer() {
+            // Clear could not be enqueued — a reconnect owns a fresh session.
+            awaitingBufferClear = false
+            AppLog.general.info("Dictation cancelled (Esc) — clear enqueue failed, relying on reconnect")
+        } else {
+            AppLog.general.info("Dictation cancelled (Esc) — awaiting buffer clear")
+        }
 
         if realtime.isConnected, case .running = supervisor.state {
             transition(to: .ready)
@@ -286,6 +310,7 @@ final class DictationController {
 
     private func beginListening() {
         guard state == .ready || state == .listening else { return }
+        guard !awaitingBufferClear else { return }
         guard intent.shouldBeginOnReadiness else { return }
         guard case .running = supervisor.state, realtime.isConnected else { return }
 
@@ -305,8 +330,8 @@ final class DictationController {
             return
         }
 
-        // Clear any leftover buffer from a previous session.
-        realtime.clearBuffer()
+        // Do not clearBuffer here — every clear ack must belong to an Esc cancel
+        // so an older start-time acknowledgement cannot open the barrier early.
         sessionTranscript = ""
         textInserter.beginSession()
 
@@ -331,9 +356,17 @@ final class DictationController {
     }
 
     private func beginListeningIfPendingIntent() {
+        guard !awaitingBufferClear else { return }
         guard intent.shouldBeginOnReadiness else { return }
         guard case .running = supervisor.state, realtime.isConnected else { return }
         beginListening()
+    }
+
+    private func handleBufferCleared() {
+        guard awaitingBufferClear else { return }
+        awaitingBufferClear = false
+        AppLog.general.info("Buffer cleared — barrier open")
+        beginListeningIfPendingIntent()
     }
 
     private func showIndicatorListening() {
@@ -459,6 +492,8 @@ final class DictationController {
     }
 
     private func handleDelta(_ delta: String) {
+        guard !awaitingBufferClear else { return }
+        guard state == .listening || state == .flushing else { return }
         sessionTranscript += delta
         print("[transcript delta] \(delta)")
         AppLog.general.info("delta: \(delta, privacy: .public)")
@@ -467,6 +502,8 @@ final class DictationController {
     }
 
     private func handleDone(_ transcript: String) {
+        guard !awaitingBufferClear else { return }
+        guard state == .listening || state == .flushing else { return }
         let finalText = transcript.isEmpty ? sessionTranscript : transcript
         print("[transcript done] \(finalText)")
         AppLog.general.info("done: \(finalText, privacy: .public)")
