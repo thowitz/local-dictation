@@ -20,7 +20,7 @@ from voxmlx.audio import log_mel_spectrogram_step
 from voxmlx.cache import RotatingKVCache
 
 from ._socket import _reserve_server_socket
-from ._watchdog import start_parent_watchdog
+from ._watchdog import start_parent_watchdog, start_startup_heartbeat
 from .audio_constants import SAMPLES_PER_TOKEN
 from .realtime_audio import (
     N_LEFT_PAD_TOKENS,
@@ -533,21 +533,31 @@ def main():
 
     import uvicorn
 
-    if args.parent_pid is not None:
-        start_parent_watchdog(args.parent_pid)
-
-    # Own the port before model download/load so collisions fail fast.
-    sock = _reserve_server_socket(args.host, args.port)
+    # Keep the macOS supervisor's activity timer alive during silent model load.
+    heartbeat = start_startup_heartbeat()
     try:
-        app = create_app(args.model, args.temp)
-    except BaseException:
-        sock.close()
-        raise
+        if args.parent_pid is not None:
+            start_parent_watchdog(args.parent_pid)
 
-    # /health is the sole readiness signal; serve on the reserved socket.
-    config = uvicorn.Config(app, host=args.host, port=args.port)
-    server = uvicorn.Server(config)
-    server.run(sockets=[sock])
+        # Own the port before model download/load so collisions fail fast.
+        sock = _reserve_server_socket(args.host, args.port)
+        try:
+            app = create_app(args.model, args.temp)
+        except BaseException:
+            sock.close()
+            raise
+
+        @app.on_event("startup")
+        async def _stop_startup_heartbeat() -> None:
+            # /health is reachable once uvicorn has started serving.
+            heartbeat.stop()
+
+        # /health is the sole readiness signal; serve on the reserved socket.
+        config = uvicorn.Config(app, host=args.host, port=args.port)
+        server = uvicorn.Server(config)
+        server.run(sockets=[sock])
+    finally:
+        heartbeat.stop()
 
 
 if __name__ == "__main__":
