@@ -20,6 +20,8 @@ Implementation-ready plans for the five open feature issues:
 
 Rebase each feature branch onto the preceding landed feature before implementation; do not implement these plans independently against the initial commit and merge them wholesale.
 
+All five issues are specification-ready. Downstream issues carry the auxiliary `blocked` label until their direct predecessor lands; immediately grabbable work is `ready-for-agent` without `blocked`.
+
 ## Shared integration contract
 
 Read the domain language in [`CONTEXT.md`](../../CONTEXT.md) and the accepted decisions in [`docs/adr/`](../adr/) before implementation.

@@ -8,6 +8,7 @@ Issues and PRDs for this repo live in GitHub Issues at
 - **Create:** `gh issue create --title "..." --body "..."`
 - **Read:** `gh issue view <number> --comments`
 - **List:** `gh issue list --state open --json number,title,body,labels,comments`
+- **List immediately grabbable work:** `gh issue list --state open --label ready-for-agent --search '-label:blocked'`
 - **Comment:** `gh issue comment <number> --body "..."`
 - **Label:** `gh issue edit <number> --add-label "..."` or `--remove-label "..."`
 - **Close:** `gh issue close <number> --comment "..."`
@@ -30,3 +31,8 @@ landing order.
 
 If an issue and its plan disagree, surface the conflict and reconcile them
 before implementation rather than silently choosing one.
+
+A fully specified issue waiting on a predecessor uses `ready-for-agent` plus the
+auxiliary `blocked` label. Its `## Blocked by` section names the dependency.
+Remove `blocked` when that dependency lands; do not send the issue back through
+`needs-triage` unless its specification actually needs maintainer evaluation.

@@ -8,7 +8,7 @@ Issues and PRDs are tracked in `omcdowell/local-dictation` GitHub Issues; implem
 
 ### Triage labels
 
-Triage uses the canonical `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix` labels. See `docs/agents/triage-labels.md`.
+Triage uses the canonical `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix` labels; `blocked` is an auxiliary dependency label. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 
