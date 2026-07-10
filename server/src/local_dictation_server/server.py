@@ -19,6 +19,7 @@ from voxmlx import _build_prompt_tokens, load_model
 from voxmlx.audio import log_mel_spectrogram_step
 from voxmlx.cache import RotatingKVCache
 
+from ._socket import _reserve_server_socket
 from ._watchdog import start_parent_watchdog
 from .audio_constants import SAMPLES_PER_TOKEN
 from .realtime_audio import (
@@ -535,10 +536,18 @@ def main():
     if args.parent_pid is not None:
         start_parent_watchdog(args.parent_pid)
 
-    app = create_app(args.model, args.temp)
-    # The socket binds inside uvicorn.run; /health is the true readiness probe.
-    print(f"VOXMLX_READY port={args.port}", flush=True)
-    uvicorn.run(app, host=args.host, port=args.port)
+    # Own the port before model download/load so collisions fail fast.
+    sock = _reserve_server_socket(args.host, args.port)
+    try:
+        app = create_app(args.model, args.temp)
+    except BaseException:
+        sock.close()
+        raise
+
+    # /health is the sole readiness signal; serve on the reserved socket.
+    config = uvicorn.Config(app, host=args.host, port=args.port)
+    server = uvicorn.Server(config)
+    server.run(sockets=[sock])
 
 
 if __name__ == "__main__":
