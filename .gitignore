@@ -1,0 +1,25 @@
+# Swift
+app/.build/
+*.xcodeproj/
+DerivedData/
+
+# Python
+server/.venv/
+server/.ruff_cache/
+server/**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local / generated
+server/test.wav
+*.wav
+.DS_Store
+*.log
+.idea/
+.vscode/
+
+# Hugging Face / model caches (never commit)
+.cache/

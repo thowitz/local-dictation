@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "local-dictation-server"
+version = "0.1.0"
+description = "Local Voxtral realtime ASR WebSocket server for local-dictation"
+requires-python = ">=3.10"
+dependencies = [
+    "voxmlx",
+    "fastapi",
+    "uvicorn[standard]",
+    "numpy",
+]
+
+[project.scripts]
+local-dictation-serve = "local_dictation_server.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/local_dictation_server"]
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "ty",
+]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
