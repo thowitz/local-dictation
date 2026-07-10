@@ -4,7 +4,7 @@
 
 Build a fully local dictation app in `/Users/oxxxx/Code/local-dictation` (currently empty) that replaces macOS dictation end-to-end:
 
-- **Same trigger key**: the 🎤 mic key on F5 (MacBook Pro M3 Max function row). Press → start dictating; press again → stop.
+- **Same trigger key**: the 🎤 mic key on F5 (MacBook Pro M3 Max function row). Configurable **Hold to Talk** or **Press to Toggle** (default) via the Mic Key Mode menu; ⌥⌘D and menu Start/Stop always toggle.
 - **Same UX**: a blue mic indicator appears at the text caret where text will land; words stream into the focused app *while speaking*.
 - **Engine**: Voxtral-Mini-4B-Realtime-2602 (6-bit MLX) — the most accurate streaming ASR that runs on Apple Silicon (FLEURS EN 4.9% WER @ 480ms delay). Built on **voxmlx** (MIT) + the ~790 LOC of server/memory optimizations from **localvoxtral's voxmlx fork** (MIT). Swift UI written fresh, native, minimal.
 
@@ -36,7 +36,7 @@ local-dictation/
 └── README.md
 ```
 
-**Dictation flow**: mic key → indicator appears at caret + mic capture starts (start sound) → server streams `response.audio_transcript.delta` tokens → typed live into the focused app → mic key again → `input_audio_buffer.commit {final:true}` → trailing tokens flush → indicator dismisses (stop sound). Esc while active = stop immediately (no flush wait; already-typed text stays; in terminal buffer mode the buffer is discarded).
+**Dictation flow**: mic key down (hold mode) or press (toggle mode) → indicator appears at caret + mic capture starts (start sound) → server streams `response.audio_transcript.delta` tokens → typed live into the focused app → mic key up / second press → `input_audio_buffer.commit {final:true}` → trailing tokens flush → indicator dismisses (stop sound). Esc while active = stop immediately (no flush wait; already-typed text stays; in terminal buffer mode the buffer is discarded).
 
 **Session/connection model**: one **persistent WebSocket** opened once the server is healthy, reused across dictation sessions — `input_audio_buffer.clear` resets between toggles (avoids per-toggle connect latency); auto-reconnect with backoff if it drops.
 
@@ -68,9 +68,10 @@ local-dictation/
 - `ServerSupervisor` (launch `server/.venv/bin/local-dictation-serve` — path from config with repo default), `RealtimeClient` (persistent connection, see flow), `AudioCapture`; wire so dictation logs transcript deltas to console first.
 - **Model download UX**: `make model` pre-downloads via `huggingface_hub.snapshot_download`; the supervisor also parses hf-hub progress lines from server stderr and shows "Downloading model… N%" in the menu bar instead of appearing hung on first run.
 
-### 3. Insertion + toggle
+### 3. Insertion + mic-key modes
 - `TextInserter` (chunked unicode CGEvents, terminal newline handling, secure-input check).
-- Toggle state machine on a temporary dev hotkey (⌥⌘D) before touching the mic key: press → capture+insert; press → commit-final, flush, stop.
+- Toggle state machine on a temporary dev hotkey (⌥⌘D) and menu Start/Stop: press → capture+insert; press → commit-final, flush, stop.
+- F13 / remapped 🎤 supports **Hold to Talk** and **Press to Toggle** (persisted Mic Key Mode preference); mode is latched on key-down.
 
 ### 4. Mic key takeover
 - `MicKeyManager`: install/remove the hidutil remap (run `hidutil` via `Process`), write/remove the LaunchAgent plist, register F13 via `RegisterEventHotKey`.
@@ -91,13 +92,13 @@ local-dictation/
 1. `server/scripts/ws_smoke.py` passes: WAV in → correct transcript deltas + final out.
 2. `swift build` clean; app launches to menu bar; server reaches `ready` (health 200) with model resident.
 3. E2E with dev hotkey: dictate into TextEdit — words appear while speaking; second press flushes tail and stops. Repeat in Safari address bar, VS Code, and iTerm2 (newline conversion, no accidental submits).
-4. Mic key: after remap install, 🎤 key toggles dictation, system dictation UI never appears, key survives reboot (LaunchAgent), `make unremap` restores stock behavior.
+4. Mic key: after remap install, 🎤 key follows the selected Mic Key Mode (hold or toggle); system dictation UI never appears; key survives reboot (LaunchAgent); `make unremap` restores stock behavior. ⌥⌘D remains toggle.
 5. Indicator appears adjacent to the caret in TextEdit/Notes; falls back near the field/mouse in Chrome/Electron apps without crashing.
 6. Latency feel-check: first word ≲1s after speech starts (480ms algorithmic + decode), steady 80ms cadence after; stop-press flush < 1s.
 7. Long-session memory check: dictate ~10 min continuously; server RSS stays bounded (encoder cache fix effective).
 
 ## Out of scope for v1
-LLM polishing, overlay-buffer/review mode, hold-for-push-to-talk gesture, settings UI (config file only), notarized .app distribution, multi-language switching UI (model handles 13 languages transparently).
+LLM polishing, overlay-buffer/review mode, settings UI (config file + Mic Key Mode menu only), notarized .app distribution, multi-language switching UI (model handles 13 languages transparently).
 
 ## Reference material for the implementing agent
 - Read-only clones (re-clone if missing): `/private/tmp/claude-501/-Users-oxxxx-Code-local-dictation/107a850e-5056-4d62-a66d-e80b7b2e07ad/scratchpad/{voxmlx, voxmlx-fork, localvoxtral}` — upstream `github.com/awni/voxmlx`, fork `github.com/T0mSIlver/voxmlx`, app `github.com/T0mSIlver/localvoxtral`. All MIT.
