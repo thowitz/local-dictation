@@ -8,6 +8,22 @@ import os
 
 // MARK: - Dictation state machine
 
+enum DictationFailure: Equatable, Sendable {
+    case server(ServerFailure)
+    case secureInput(String)
+    case accessibility(String)
+    case app(String)
+
+    var menuSummary: String {
+        switch self {
+        case .server(let failure):
+            return failure.menuSummary
+        case .secureInput(let message), .accessibility(let message), .app(let message):
+            return message
+        }
+    }
+}
+
 enum DictationState: Equatable, Sendable {
     case idle
     case starting
@@ -15,7 +31,8 @@ enum DictationState: Equatable, Sendable {
     case ready
     case listening
     case flushing
-    case error(String)
+    case restarting(ServerRestartStatus)
+    case failed(DictationFailure)
 
     /// Nil → flattened template bitmap (tracks menu-bar light/dark). Colored
     /// only for transient / active states. Raw SF Symbol `isTemplate` stays
@@ -24,13 +41,13 @@ enum DictationState: Equatable, Sendable {
         switch self {
         case .idle, .ready:
             return nil
-        case .starting, .downloading:
+        case .starting, .downloading, .restarting:
             return .systemOrange
         case .listening:
             return .systemBlue
         case .flushing:
             return .systemPurple
-        case .error:
+        case .failed:
             return .systemRed
         }
     }
@@ -52,8 +69,10 @@ enum DictationState: Equatable, Sendable {
             return "Listening"
         case .flushing:
             return "Flushing…"
-        case .error(let message):
-            return "Error: \(message)"
+        case .restarting(let status):
+            return status.menuSummary
+        case .failed(let failure):
+            return failure.menuSummary
         }
     }
 }
@@ -133,7 +152,7 @@ final class DictationController {
                         // Don't flip the whole UI to error on transient WS blips while idle/ready.
                         if self?.state == .listening || self?.state == .flushing {
                             self?.endIndicatorSession(playSound: true)
-                            self?.transition(to: .error(message))
+                            self?.transition(to: .failed(.app(message)))
                         }
                     }
                 }
@@ -151,7 +170,7 @@ final class DictationController {
         switch state {
         case .listening:
             stopDictation()
-        case .ready, .idle, .error:
+        case .ready, .idle, .failed:
             startDictation()
         default:
             break
@@ -163,7 +182,7 @@ final class DictationController {
             wantsListening = false
             let message = "Secure input is enabled — dictation refused."
             AppLog.general.error("\(message, privacy: .public)")
-            transition(to: .error(message))
+            transition(to: .failed(.secureInput(message)))
             return
         }
 
@@ -171,21 +190,28 @@ final class DictationController {
             wantsListening = false
             let message = "Accessibility permission required — grant it in System Settings."
             AppLog.general.error("\(message, privacy: .public)")
-            transition(to: .error(message))
+            transition(to: .failed(.accessibility(message)))
             return
         }
 
         switch state {
         case .ready:
             break
-        case .listening, .flushing, .starting, .downloading:
+        case .listening, .flushing, .starting, .downloading, .restarting:
             return
-        case .idle, .error:
+        case .idle, .failed:
             // Kick the server if needed, then wait for ready.
             wantsListening = true
-            if case .idle = state {
+            switch state {
+            case .idle:
                 transition(to: .starting)
                 supervisor.start()
+            case .failed(.server):
+                // Terminal server failure: retry supervision without opening the mic yet.
+                transition(to: .starting)
+                supervisor.retry()
+            default:
+                break
             }
             return
         }
@@ -235,7 +261,7 @@ final class DictationController {
             wantsListening = false
             let message = "Secure input is enabled — dictation refused (synthetic keys are dropped)."
             AppLog.general.error("\(message, privacy: .public)")
-            transition(to: .error(message))
+            transition(to: .failed(.secureInput(message)))
             return
         }
 
@@ -243,7 +269,7 @@ final class DictationController {
             wantsListening = false
             let message = "Accessibility permission required — grant it in System Settings."
             AppLog.general.error("\(message, privacy: .public)")
-            transition(to: .error(message))
+            transition(to: .failed(.accessibility(message)))
             return
         }
 
@@ -258,7 +284,7 @@ final class DictationController {
             }
         } catch {
             textInserter.discard()
-            transition(to: .error(error.localizedDescription))
+            transition(to: .failed(.app(error.localizedDescription)))
             return
         }
 
@@ -290,22 +316,33 @@ final class DictationController {
         }
     }
 
+    /// Retry a terminal server failure without opening the microphone.
+    func retryServer() {
+        wantsListening = false
+        transition(to: .starting)
+        supervisor.retry()
+    }
+
     private func handleServerState(_ serverState: ServerSupervisor.State) {
         switch serverState {
         case .idle, .stopped:
             if state != .idle {
-                escapeHotKey.unregister()
-                audio.stop()
-                textInserter.discard()
-                endIndicatorSession(playSound: state == .listening || state == .flushing)
+                interruptActiveSessionIfNeeded()
                 realtime.disconnect()
                 transition(to: .idle)
             }
 
-        case .launching, .waitingForReady, .restarting:
+        case .launching, .waitingForReady:
             if state != .listening && state != .flushing {
                 transition(to: .starting)
             }
+
+        case .restarting(let status):
+            // Process died between generations — interrupt any active session,
+            // then ALWAYS surface Restarting N/5 (do not leave UI as listening
+            // for a later generic .starting from the realtime disconnect path).
+            interruptActiveSessionIfNeeded()
+            transition(to: .restarting(status))
 
         case .downloading(let percent):
             if state != .listening && state != .flushing {
@@ -314,6 +351,7 @@ final class DictationController {
 
         case .running:
             // Open (or keep) the persistent WebSocket once the server is healthy.
+            // After an interruption, wantsListening was cleared — do not reopen mic.
             if !realtime.isConnected {
                 realtime.connect()
             } else if state != .listening && state != .flushing {
@@ -323,14 +361,27 @@ final class DictationController {
                 }
             }
 
-        case .failed(let message):
-            escapeHotKey.unregister()
-            audio.stop()
-            textInserter.discard()
-            endIndicatorSession(playSound: state == .listening || state == .flushing)
+        case .failed(let failure):
+            interruptActiveSessionIfNeeded()
             realtime.disconnect()
-            transition(to: .error(message))
+            transition(to: .failed(.server(failure)))
         }
+    }
+
+    /// Narrow crash/interrupt cleanup: stop audio, keep already-inserted live
+    /// text, discard uninserted terminal-target buffer, end indicator, clear
+    /// Esc + wantsListening. Does not reopen the mic on later recovery.
+    private func interruptActiveSessionIfNeeded() {
+        let wasActive = state == .listening || state == .flushing
+        guard wasActive else { return }
+        wantsListening = false
+        escapeHotKey.unregister()
+        audio.stop()
+        // discard() keeps already-inserted live text; drops only the uninserted buffer.
+        textInserter.discard()
+        sessionTranscript = ""
+        endIndicatorSession(playSound: true)
+        realtime.disconnect()
     }
 
     private func handleConnectionState(_ connection: RealtimeClient.ConnectionState) {
@@ -434,6 +485,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var axPermissionItem: NSMenuItem!
     private var secureInputItem: NSMenuItem!
     private var serverStatusItem: NSMenuItem!
+    private var showServerDetailsItem: NSMenuItem!
+    private var retryServerItem: NSMenuItem!
     private var statusItemLabel: NSMenuItem!
 
     /// Dev toggle hotkey: ⌥⌘D (Option+Command+D).
@@ -488,6 +541,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         serverStatusItem = NSMenuItem(title: "Server: …", action: nil, keyEquivalent: "")
         serverStatusItem.isEnabled = false
         menu.addItem(serverStatusItem)
+
+        showServerDetailsItem = NSMenuItem(
+            title: "Show Server Details…",
+            action: #selector(showServerDetails),
+            keyEquivalent: ""
+        )
+        showServerDetailsItem.target = self
+        showServerDetailsItem.isHidden = true
+        menu.addItem(showServerDetailsItem)
+
+        retryServerItem = NSMenuItem(
+            title: "Retry Server",
+            action: #selector(retryServer),
+            keyEquivalent: ""
+        )
+        retryServerItem.target = self
+        retryServerItem.isHidden = true
+        menu.addItem(retryServerItem)
 
         menu.addItem(.separator())
 
@@ -762,24 +833,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func showServerDetails() {
+        guard let details = DictationPresentation.detailsText(for: controller.state) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Server Details"
+        alert.informativeText = details
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Copy Details")
+        alert.addButton(withTitle: "OK")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(details, forType: .string)
+        }
+    }
+
+    @objc private func retryServer() {
+        controller.retryServer()
+    }
+
     private func refreshUI(for state: DictationState) {
         applyMenuBarIcon(for: state)
+        // Keep the menu-bar title concise — never put long diagnostics there.
         statusItemLabel.title = "Status: \(state.statusTitle)"
 
         switch state {
         case .listening:
             startStopItem.title = "Stop Dictation"
             startStopItem.isEnabled = true
-        case .ready, .idle, .error:
+        case .ready, .idle, .failed:
             startStopItem.title = "Start Dictation"
             startStopItem.isEnabled = true
-        case .starting, .downloading, .flushing:
+        case .starting, .downloading, .flushing, .restarting:
             startStopItem.title = "Start Dictation"
             startStopItem.isEnabled = false
         }
 
         refreshServerStatusRow(for: state)
+        refreshServerActionItems(for: state)
         refreshPermissionRows()
+    }
+
+    private func refreshServerActionItems(for state: DictationState) {
+        showServerDetailsItem.isHidden = !DictationPresentation.showsServerDetails(for: state)
+        retryServerItem.isHidden = !DictationPresentation.showsRetryServer(for: state)
     }
 
     /// Idle: flattened bitmap template so AppKit tints like system menu-bar
@@ -829,28 +925,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshServerStatusRow(for state: DictationState) {
-        switch state {
-        case .downloading(let percent):
-            if let percent {
-                serverStatusItem.title = "Server: Downloading model… \(percent)%"
-            } else {
-                serverStatusItem.title = "Server: Downloading model…"
-            }
-        case .starting:
-            serverStatusItem.title = "Server: Starting / reconnecting…"
-        case .ready, .listening, .flushing:
-            serverStatusItem.title = "Server: Running"
-        case .idle:
-            serverStatusItem.title = "Server: Stopped"
-        case .error(let message):
-            if message.localizedCaseInsensitiveContains("secure input") {
-                serverStatusItem.title = "Server: Running"
-            } else if message.localizedCaseInsensitiveContains("accessibility") {
-                serverStatusItem.title = "Server: —"
-            } else {
-                serverStatusItem.title = "Server: Error / restarting"
-            }
-        }
+        serverStatusItem.title = DictationPresentation.serverRowTitle(for: state)
     }
 
     private func refreshPermissionRows() {
