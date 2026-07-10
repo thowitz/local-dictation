@@ -4,6 +4,14 @@ Native, fully local dictation for macOS — a drop-in replacement for system Dic
 
 Two processes, one repo: a Python WebSocket ASR server (`server/`) and a menu-bar Swift app (`app/`) that captures audio, inserts text, and supervises the server.
 
+## Install (release download)
+
+Grab the latest `LocalDictation-v*.zip` from [GitHub Releases](https://github.com/omcdowell/local-dictation/releases), verify the checksum (`shasum -a 256 -c LocalDictation-v*.zip.sha256`), unzip, and drag the app into `/Applications`. Downloads are **arm64 / macOS 15+** and **not notarized** — on first launch, **right-click → Open** (or clear quarantine); see [Persistent Launch at Login](#persistent-launch-at-login-one-time-signing-setup) and the release notes for why.
+
+1. Download the zip + `.sha256` from the latest release
+2. Verify, unzip, install to `/Applications`
+3. Right-click → Open on first launch; finish the Setup Checklist
+
 ## Requirements
 
 ### Build (development / packaging)
@@ -51,6 +59,8 @@ works **except Launch at Login**, which won't persist (see below).
 ditto dist/LocalDictation.app /Applications/LocalDictation.app
 open /Applications/LocalDictation.app
 ```
+
+Released binaries from [GitHub Releases](https://github.com/omcdowell/local-dictation/releases) are signed with the maintainer's self-signed `Local Dictation Signing` certificate, so **Launch at Login** persists across app updates for downloaded copies too.
 
 Grant **Microphone**, **Accessibility**, and **Input Monitoring** to the **installed** `/Applications/LocalDictation.app` (not the raw `make run` binary). TCC grants are signature/path-specific; preferences share the `com.omcdowell.LocalDictation` defaults suite across raw and packaged runs.
 
@@ -183,11 +193,16 @@ Prefer `make model` beforehand on a good network so the first supervised start d
 | `make model` | Pre-download the default Hugging Face model |
 | `make package` | Build signed `dist/LocalDictation.app` (arm64, embedded Python/MLX) |
 | `make package-check` | Verify package layout, signatures, and bundled server `--help` |
+| `make release` | Build, zip, tag and publish a GitHub Release (`RELEASE_FLAGS=--dry-run` to rehearse) |
 | `make remap` / `make unremap` | Direct `hidutil` UserKeyMapping set/clear |
 | `make smoke` | Generate test WAV, briefly start server, run `ws_smoke.py` |
 | `make test` | Swift tests in `app/` + Python `unittest` in `server/tests/` |
 | `make lint` | `ruff check`, `ruff format --check`, `ty check` |
 | `make clean` | Remove `.build`, `.venv`, `.package-build/`, `dist/`, caches (not the HF model cache) |
+
+### Releasing
+
+Bump `CFBundleShortVersionString` in `app/Resources/Info.plist` and `version` in `server/pyproject.toml` (must match), write `docs/release-notes/v<version>.md`, then `make release RELEASE_FLAGS=--dry-run` to rehearse and `make release` to tag `v<version>` and publish with `gh`. Refuses ad-hoc signing (run `make signing-identity` first) and requires a clean, pushed `main`.
 
 ### Testing
 

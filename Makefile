@@ -19,7 +19,7 @@ DEV := $(shell xcode-select -p)
 TEST_FW := $(DEV)/Library/Developer/Frameworks
 TEST_LIB := $(DEV)/Library/Developer/usr/lib
 
-.PHONY: server app run model remap unremap smoke test lint signing-identity package package-check clean help
+.PHONY: server app run model remap unremap smoke test lint signing-identity package package-check release clean help
 
 help:
 	@echo "Targets:"
@@ -35,6 +35,7 @@ help:
 	@echo "  signing-identity - create a stable self-signed identity (one-time; needed for Launch at Login)"
 	@echo "  package        - build signed dist/LocalDictation.app (arm64)"
 	@echo "  package-check  - verify dist/LocalDictation.app layout + bundled server"
+	@echo "  release        - build, zip, tag and publish a GitHub release (RELEASE_FLAGS=--dry-run to rehearse)"
 	@echo "  clean          - remove build artifacts, package staging, and venv"
 
 server:
@@ -140,6 +141,9 @@ package:
 
 package-check:
 	"$(ROOT)/scripts/verify-package.sh"
+
+release:
+	"$(ROOT)/scripts/release.sh" $(RELEASE_FLAGS)
 
 clean:
 	rm -rf $(APP_DIR)/.build
