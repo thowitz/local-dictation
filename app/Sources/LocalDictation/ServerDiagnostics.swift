@@ -367,6 +367,23 @@ struct BoundedStderrCollector: Equatable, Sendable {
         return body
     }
 
+    /// Text after the last `——— attempt N ———` separator (current attempt only).
+    func currentAttemptSegment() -> String {
+        let body = lines.joined(separator: "\n")
+        guard let range = body.range(
+            of: Self.attemptSeparatorPrefix,
+            options: .backwards
+        ) else {
+            return body
+        }
+        // Skip past the separator line itself.
+        let afterPrefix = body[range.lowerBound...]
+        if let lineEnd = afterPrefix.firstIndex(of: "\n") {
+            return String(afterPrefix[afterPrefix.index(after: lineEnd)...])
+        }
+        return ""
+    }
+
     // MARK: Private — UTF-8
 
     /// Decode the whole pending buffer in one pass, then ingest once.

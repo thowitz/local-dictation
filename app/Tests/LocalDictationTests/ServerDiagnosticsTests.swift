@@ -78,6 +78,21 @@ struct ServerDiagnosticsTests {
         #expect(tail.contains("second"))
     }
 
+    @Test("currentAttemptSegment excludes prior-attempt eaddrinuse noise")
+    func currentAttemptSegmentExcludesPriorPortNoise() {
+        var collector = BoundedStderrCollector()
+        collector.beginAttempt(1)
+        collector.append(data: Data("note: saw eaddrinuse in a library probe\n".utf8))
+        collector.beginAttempt(2)
+        collector.append(data: Data("clean crash\n".utf8))
+        collector.flushEOF()
+
+        let segment = collector.currentAttemptSegment()
+        #expect(segment.contains("clean crash"))
+        #expect(!segment.contains("eaddrinuse"))
+        #expect(collector.tail().contains("eaddrinuse"), "full tail still retains prior attempt")
+    }
+
     @Test("Reset clears collector for a new supervision run")
     func resetClearsCollectorForNewRun() {
         var collector = BoundedStderrCollector()
