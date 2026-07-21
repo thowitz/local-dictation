@@ -343,6 +343,12 @@ def create_app(model_path: str, temperature: float = 0.0):
     model, sp, config = load_model(model_path)
     logger.info("Model loaded in %.1fs", time.monotonic() - t0)
 
+    # Cap MLX's Metal buffer-reuse pool. The app holds one long-lived
+    # WebSocket, so without a ceiling the pool of freed-but-retained GPU
+    # buffers grows for the life of the connection (observed ~14 GB). 512 MB
+    # is ample headroom for streaming reuse; excess is returned to the OS.
+    mx.set_cache_limit(512 * 1024 * 1024)
+
     app = FastAPI(title="local-dictation realtime server")
 
     @app.get("/health")
@@ -462,6 +468,7 @@ def create_app(model_path: str, temperature: float = 0.0):
                             }
                         )
                         session.reset()
+                        mx.clear_cache()
 
                 elif msg_type == "input_audio_buffer.commit":
                     # Only finalize/reset when the client explicitly marks
@@ -489,6 +496,7 @@ def create_app(model_path: str, temperature: float = 0.0):
                             }
                         )
                         session.reset()
+                        mx.clear_cache()
                     # Non-final commits are no-ops (we process continuously)
 
                 elif msg_type == "input_audio_buffer.clear":
