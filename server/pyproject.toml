@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "local-dictation-server"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local Voxtral realtime ASR WebSocket server for local-dictation"
 requires-python = ">=3.10"
 dependencies = [
