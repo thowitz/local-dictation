@@ -104,6 +104,42 @@ struct AppConfigTests {
         #expect(config.websocketURL.absoluteString == "ws://127.0.0.1:9001/v1/realtime")
     }
 
+    @Test("Default provider is voxtral")
+    func defaultProviderIsVoxtral() throws {
+        let json = #"{}"#
+        let config = try AppConfig.decode(Data(json.utf8))
+        #expect(config.provider == .voxtral)
+        #expect(config.parakeetModelPath == nil)
+    }
+
+    @Test("Parakeet provider and model path decode")
+    func parakeetProviderAndModelPathDecode() throws {
+        let json = #"{"provider": "parakeet", "parakeetModelPath": "~/parakeet-tdt-0.6b-v3-coreml"}"#
+        let config = try AppConfig.decode(Data(json.utf8))
+        #expect(config.provider == .parakeet)
+        #expect(config.parakeetModelPath == "~/parakeet-tdt-0.6b-v3-coreml")
+    }
+
+    @Test("Provider is case-insensitive")
+    func providerIsCaseInsensitive() throws {
+        let json = #"{"provider": "Parakeet"}"#
+        let config = try AppConfig.decode(Data(json.utf8))
+        #expect(config.provider == .parakeet)
+    }
+
+    @Test("Invalid provider is actionable")
+    func invalidProviderIsActionable() {
+        do {
+            _ = try AppConfig.decode(Data(#"{"provider": "whisper"}"#.utf8))
+            Issue.record("Expected invalid provider to throw")
+        } catch let error as AppConfig.ValidationError {
+            #expect(error == .invalidProvider("whisper"))
+            #expect(error.description.contains("voxtral"))
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
     @Test("resolveServerLaunchCommand uses override")
     func resolveServerLaunchCommandUsesOverride() throws {
         try TestSupport.withTemporaryDirectory { root in

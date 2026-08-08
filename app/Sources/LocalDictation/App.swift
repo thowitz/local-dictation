@@ -126,7 +126,7 @@ final class DictationController {
 
     private let config: AppConfig
     private let deps: Dependencies
-    private let supervisor: ServerSupervisor
+    private let supervisor: any SpeechRuntime
     private let realtime: any DictationRealtimeClient
     private let idleScheduler: IdleUnloadScheduler
     private let audio = AudioCapture()
@@ -150,6 +150,9 @@ final class DictationController {
     /// Test seam: whether the idle unload deadline is currently armed.
     var isIdleSchedulerArmed: Bool { idleScheduler.isArmed }
 
+    /// Test seam: underlying speech runtime (Voxtral supervisor or Parakeet).
+    var speechRuntime: any SpeechRuntime { supervisor }
+
     convenience init(config: AppConfig) {
         self.init(config: config, dependencies: .production())
     }
@@ -157,13 +160,29 @@ final class DictationController {
     init(
         config: AppConfig,
         dependencies: Dependencies,
-        supervisor: ServerSupervisor? = nil,
+        supervisor: (any SpeechRuntime)? = nil,
         realtime: (any DictationRealtimeClient)? = nil
     ) {
         self.config = config
         self.deps = dependencies
-        self.supervisor = supervisor ?? ServerSupervisor(config: config)
-        self.realtime = realtime ?? RealtimeClient(endpoint: config.websocketURL)
+
+        // Production wiring: pick Voxtral (Python WS) or Parakeet (in-process CoreML).
+        // Tests inject both seams explicitly.
+        if let supervisor, let realtime {
+            self.supervisor = supervisor
+            self.realtime = realtime
+        } else if let supervisor {
+            self.supervisor = supervisor
+            self.realtime = realtime ?? Self.makeRealtimeClient(config: config, sharedEngine: nil)
+        } else if let realtime {
+            self.supervisor = Self.makeSpeechRuntime(config: config, sharedEngine: nil)
+            self.realtime = realtime
+        } else {
+            let pair = Self.makeProviderPair(config: config)
+            self.supervisor = pair.runtime
+            self.realtime = pair.client
+        }
+
         self.idleScheduler = IdleUnloadScheduler(
             timeout: config.idleUnloadTimeout,
             sleep: dependencies.sleep
@@ -216,6 +235,43 @@ final class DictationController {
                 }
             )
         )
+    }
+
+    /// Builds a matched runtime + client pair for the configured provider.
+    private static func makeProviderPair(
+        config: AppConfig
+    ) -> (runtime: any SpeechRuntime, client: any DictationRealtimeClient) {
+        switch config.provider {
+        case .voxtral:
+            return (ServerSupervisor(config: config), RealtimeClient(endpoint: config.websocketURL))
+        case .parakeet:
+            let engine = ParakeetEngine()
+            return (ParakeetRuntime(config: config, engine: engine), ParakeetRealtimeClient(engine: engine))
+        }
+    }
+
+    private static func makeSpeechRuntime(
+        config: AppConfig,
+        sharedEngine: ParakeetEngine?
+    ) -> any SpeechRuntime {
+        switch config.provider {
+        case .voxtral:
+            return ServerSupervisor(config: config)
+        case .parakeet:
+            return ParakeetRuntime(config: config, engine: sharedEngine ?? ParakeetEngine())
+        }
+    }
+
+    private static func makeRealtimeClient(
+        config: AppConfig,
+        sharedEngine: ParakeetEngine?
+    ) -> any DictationRealtimeClient {
+        switch config.provider {
+        case .voxtral:
+            return RealtimeClient(endpoint: config.websocketURL)
+        case .parakeet:
+            return ParakeetRealtimeClient(engine: sharedEngine ?? ParakeetEngine())
+        }
     }
 
     func bootstrap() {
@@ -740,6 +796,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var micKeyModeItem: NSMenuItem!
     private var holdToTalkModeItem: NSMenuItem!
     private var pressToToggleModeItem: NSMenuItem!
+    private var speechProviderItem: NSMenuItem!
+    private var voxtralProviderItem: NSMenuItem!
+    private var parakeetProviderItem: NSMenuItem!
+    private var parakeetModelPathItem: NSMenuItem!
+    private var clearParakeetPathItem: NSMenuItem!
     private var micPermissionItem: NSMenuItem!
     private var axPermissionItem: NSMenuItem!
     private var secureInputItem: NSMenuItem!
@@ -920,6 +981,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         playSoundsItem.target = self
         menu.addItem(playSoundsItem)
 
+        let speechProviderMenu = NSMenu()
+        voxtralProviderItem = NSMenuItem(
+            title: SpeechProvider.voxtral.displayName,
+            action: #selector(selectVoxtralProvider),
+            keyEquivalent: ""
+        )
+        voxtralProviderItem.target = self
+        speechProviderMenu.addItem(voxtralProviderItem)
+
+        parakeetProviderItem = NSMenuItem(
+            title: SpeechProvider.parakeet.displayName,
+            action: #selector(selectParakeetProvider),
+            keyEquivalent: ""
+        )
+        parakeetProviderItem.target = self
+        speechProviderMenu.addItem(parakeetProviderItem)
+
+        speechProviderMenu.addItem(.separator())
+
+        parakeetModelPathItem = NSMenuItem(
+            title: "Choose Parakeet Model Folder…",
+            action: #selector(chooseParakeetModelPath),
+            keyEquivalent: ""
+        )
+        parakeetModelPathItem.target = self
+        speechProviderMenu.addItem(parakeetModelPathItem)
+
+        clearParakeetPathItem = NSMenuItem(
+            title: "Clear Parakeet Model Path",
+            action: #selector(clearParakeetModelPath),
+            keyEquivalent: ""
+        )
+        clearParakeetPathItem.target = self
+        speechProviderMenu.addItem(clearParakeetPathItem)
+
+        speechProviderItem = NSMenuItem(title: "Speech Provider", action: nil, keyEquivalent: "")
+        speechProviderItem.submenu = speechProviderMenu
+        menu.addItem(speechProviderItem)
+
         menu.addItem(.separator())
 
         micPermissionItem = NSMenuItem(
@@ -958,6 +1058,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshLaunchAtLoginItem()
         refreshPlaySoundsItem()
         refreshMicKeyModeItems()
+        refreshSpeechProviderItems()
         refreshRemapItems()
         refreshUI(for: .idle)
 
@@ -1026,6 +1127,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func selectPressToToggleMode() {
         MicKeyMode.write(.toggle, to: AppIdentity.defaults)
         refreshMicKeyModeItems()
+    }
+
+    @objc private func selectVoxtralProvider() {
+        applySpeechProvider(.voxtral)
+    }
+
+    @objc private func selectParakeetProvider() {
+        applySpeechProvider(.parakeet)
+    }
+
+    @objc private func chooseParakeetModelPath() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "Select"
+        panel.message =
+            "Select a Parakeet CoreML model folder containing Preprocessor/Encoder/Decoder/JointDecisionv3 and parakeet_vocab.json."
+        if let current = config.parakeetModelPath, !current.isEmpty {
+            let expanded = (current as NSString).expandingTildeInPath
+            panel.directoryURL = URL(fileURLWithPath: expanded, isDirectory: true)
+        } else {
+            panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser
+        }
+
+        // Accessory-only apps need activation so the open panel is visible.
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        guard ParakeetEngine.containsV3Bundles(at: url) else {
+            let alert = NSAlert()
+            alert.messageText = "Not a Parakeet v3 model folder"
+            alert.informativeText = """
+            Expected these items inside the folder:
+            • Preprocessor.mlmodelc
+            • Encoder.mlmodelc
+            • Decoder.mlmodelc
+            • JointDecisionv3.mlmodelc
+            • parakeet_vocab.json
+
+            Selected: \(url.path)
+            """
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        config.parakeetModelPath = url.path
+        // Choosing a model folder implies using Parakeet.
+        config.provider = .parakeet
+        config.save()
+        rebootstrapSpeechRuntime()
+        refreshSpeechProviderItems()
+        AppLog.general.info(
+            "Parakeet model path set to \(url.path, privacy: .public); speech runtime restarted"
+        )
+    }
+
+    @objc private func clearParakeetModelPath() {
+        guard config.parakeetModelPath != nil else { return }
+        config.parakeetModelPath = nil
+        config.save()
+        if config.provider == .parakeet {
+            rebootstrapSpeechRuntime()
+        }
+        refreshSpeechProviderItems()
+    }
+
+    private func applySpeechProvider(_ provider: SpeechProvider) {
+        guard config.provider != provider else {
+            refreshSpeechProviderItems()
+            return
+        }
+        config.provider = provider
+        config.save()
+        rebootstrapSpeechRuntime()
+        refreshSpeechProviderItems()
+        AppLog.general.info(
+            "Speech provider switched to \(provider.rawValue, privacy: .public); speech runtime restarted"
+        )
+    }
+
+    /// Tear down the active speech runtime and rebuild from the current config
+    /// so provider / model-path menu changes apply without quitting the app.
+    private func rebootstrapSpeechRuntime() {
+        controller.shutdown()
+        let fresh = DictationController(config: config)
+        fresh.onStateChange = { [weak self] state in
+            self?.refreshUI(for: state)
+        }
+        controller = fresh
+        controller.bootstrap()
+        refreshUI(for: controller.state)
     }
 
     private func handleMicKeyPressed() {
@@ -1098,6 +1294,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshRemapItems()
         refreshPlaySoundsItem()
         refreshMicKeyModeItems()
+        refreshSpeechProviderItems()
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -1381,6 +1578,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let mode = MicKeyMode.read(from: AppIdentity.defaults)
         holdToTalkModeItem.state = mode == .holdToTalk ? .on : .off
         pressToToggleModeItem.state = mode == .toggle ? .on : .off
+    }
+
+    private func refreshSpeechProviderItems() {
+        let provider = config.provider
+        voxtralProviderItem.state = provider == .voxtral ? .on : .off
+        parakeetProviderItem.state = provider == .parakeet ? .on : .off
+        speechProviderItem.title = "Speech Provider: \(provider.displayName)"
+
+        if let path = config.parakeetModelPath, !path.isEmpty {
+            let display = (path as NSString).abbreviatingWithTildeInPath
+            parakeetModelPathItem.title = "Parakeet Model: \(display)"
+            clearParakeetPathItem.isEnabled = true
+        } else if let resolved = ParakeetEngine.resolveModelDirectory(explicitPath: nil) {
+            let display = (resolved.path as NSString).abbreviatingWithTildeInPath
+            parakeetModelPathItem.title = "Parakeet Model: \(display) (auto)"
+            clearParakeetPathItem.isEnabled = false
+        } else {
+            parakeetModelPathItem.title = "Choose Parakeet Model Folder…"
+            clearParakeetPathItem.isEnabled = false
+        }
     }
 
     private func refreshRemapItems() {

@@ -5,13 +5,22 @@ import Foundation
 struct AppConfig: Codable, Sendable {
     /// Absolute path to a server executable override. When set, resolution treats
     /// it as authoritative (no fallback on invalid/non-executable paths).
+    /// Only used when `provider == .voxtral`.
     var serverExecutable: String?
 
-    /// WebSocket / health port (default 8471).
+    /// WebSocket / health port (default 8471). Only used when `provider == .voxtral`.
     var port: Int
 
-    /// Optional HF model id override passed as `--model`.
+    /// Optional HF model id override passed as `--model` (Voxtral path only).
     var model: String?
+
+    /// Speech backend. Defaults to `.voxtral` (Python MLX server).
+    var provider: SpeechProvider
+
+    /// Optional path to a staged Parakeet CoreML repo folder
+    /// (e.g. `~/parakeet-tdt-0.6b-v3-coreml`). When set, FluidAudio loads offline
+    /// from this directory instead of downloading. Only used for `.parakeet`.
+    var parakeetModelPath: String?
 
     /// Minutes of inactivity before unloading the speech runtime.
     /// `0` disables unload; omitted/negative values resolve to `defaultIdleUnloadMinutes`.
@@ -19,6 +28,7 @@ struct AppConfig: Codable, Sendable {
 
     static let defaultPort = 8471
     static let defaultIdleUnloadMinutes: Double = 10
+    static let defaultProvider: SpeechProvider = .voxtral
     static let supportDirectoryName = "LocalDictation"
     static let configFileName = "config.json"
 
@@ -26,16 +36,21 @@ struct AppConfig: Codable, Sendable {
         case serverExecutable
         case port
         case model
+        case provider
+        case parakeetModelPath
         case idleUnloadMinutes
     }
 
     enum ValidationError: Error, Equatable, CustomStringConvertible {
         case invalidPort(Int)
+        case invalidProvider(String)
 
         var description: String {
             switch self {
             case .invalidPort(let value):
                 return "Invalid port \(value); expected an integer in 1...65535."
+            case .invalidProvider(let value):
+                return "Invalid provider \(value); expected \"voxtral\" or \"parakeet\"."
             }
         }
     }
@@ -53,11 +68,15 @@ struct AppConfig: Codable, Sendable {
         serverExecutable: String? = nil,
         port: Int = defaultPort,
         model: String? = nil,
+        provider: SpeechProvider = defaultProvider,
+        parakeetModelPath: String? = nil,
         idleUnloadMinutes: Double = defaultIdleUnloadMinutes
     ) {
         self.serverExecutable = serverExecutable
         self.port = port
         self.model = model
+        self.provider = provider
+        self.parakeetModelPath = parakeetModelPath
         self.idleUnloadMinutes = Self.normalizedIdleUnloadMinutes(idleUnloadMinutes)
     }
 
@@ -66,8 +85,27 @@ struct AppConfig: Codable, Sendable {
         serverExecutable = try container.decodeIfPresent(String.self, forKey: .serverExecutable)
         port = try container.decodeIfPresent(Int.self, forKey: .port) ?? Self.defaultPort
         model = try container.decodeIfPresent(String.self, forKey: .model)
+        if let rawProvider = try container.decodeIfPresent(String.self, forKey: .provider) {
+            guard let parsed = SpeechProvider(rawValue: rawProvider.lowercased()) else {
+                throw ValidationError.invalidProvider(rawProvider)
+            }
+            provider = parsed
+        } else {
+            provider = Self.defaultProvider
+        }
+        parakeetModelPath = try container.decodeIfPresent(String.self, forKey: .parakeetModelPath)
         let rawIdle = try container.decodeIfPresent(Double.self, forKey: .idleUnloadMinutes)
         idleUnloadMinutes = Self.normalizedIdleUnloadMinutes(rawIdle ?? Self.defaultIdleUnloadMinutes)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(serverExecutable, forKey: .serverExecutable)
+        try container.encode(port, forKey: .port)
+        try container.encodeIfPresent(model, forKey: .model)
+        try container.encode(provider.rawValue, forKey: .provider)
+        try container.encodeIfPresent(parakeetModelPath, forKey: .parakeetModelPath)
+        try container.encode(idleUnloadMinutes, forKey: .idleUnloadMinutes)
     }
 
     /// Effective idle timeout, or `nil` when unload is disabled (`idleUnloadMinutes == 0`).
