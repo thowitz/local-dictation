@@ -307,6 +307,12 @@ while IFS= read -r -d '' link; do
 done < <(find "$APP_STAGE" -type l -print0)
 
 # --- 10: sign inner-first, then outer; never --deep to sign ----------------
+#
+# iCloud Drive / Finder can attach resource forks and com.apple.* xattrs that
+# make codesign fail with "resource fork, Finder information, or similar
+# detritus not allowed". Scrub before any codesign call.
+log "Scrubbing extended attributes / resource forks before codesign"
+xattr -cr "$APP_STAGE" 2>/dev/null || true
 
 log "Code-signing nested Mach-O binaries under Helpers/LocalDictationServer.bundle ($CODESIGN_SOURCE)"
 while IFS= read -r -d '' macho; do
