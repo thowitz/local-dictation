@@ -41,6 +41,10 @@ help:
 server:
 	cd $(SERVER_DIR) && uv sync --group dev
 
+# Optional Parakeet MLX backend (Python 3.12 recommended for numba/librosa).
+server-parakeet:
+	cd $(SERVER_DIR) && uv sync --group dev --group parakeet --python 3.12
+
 app:
 	cd $(APP_DIR) && swift build -c release
 

@@ -118,6 +118,19 @@ struct AppConfigTests {
         let config = try AppConfig.decode(Data(json.utf8))
         #expect(config.provider == .parakeet)
         #expect(config.parakeetModelPath == "~/parakeet-tdt-0.6b-v3-coreml")
+        #expect(config.parakeetChunkSeconds == AppConfig.defaultParakeetChunkSeconds)
+        #expect(config.serverBackendFlag == nil)
+    }
+
+    @Test("Parakeet MLX provider resolves server flags")
+    func parakeetMlxProviderResolvesServerFlags() throws {
+        let json = #"{"provider": "parakeet-mlx", "parakeetChunkSeconds": 0.75}"#
+        let config = try AppConfig.decode(Data(json.utf8))
+        #expect(config.provider == .parakeetMlx)
+        #expect(config.serverBackendFlag == "parakeet-mlx")
+        #expect(config.resolvedServerModel == SpeechProvider.parakeetMlxDefaultModel)
+        #expect(config.parakeetChunkSeconds == 0.75)
+        #expect(config.provider.usesPythonServer)
     }
 
     @Test("Provider is case-insensitive")

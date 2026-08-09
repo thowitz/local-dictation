@@ -35,27 +35,43 @@ struct ServerLaunchCommand: Equatable, Sendable {
         """
     }
 
-    /// Assembles Process arguments: prefix, then `--port` / `--parent-pid`, then optional `--model`.
+    /// Assembles Process arguments: prefix, then port/parent-pid, optional backend/model/chunk.
     static func processArguments(
         prefix: [String],
         port: Int,
         parentPID: Int32,
-        model: String?
+        model: String?,
+        backend: String? = nil,
+        chunkSeconds: Double? = nil
     ) -> [String] {
         var args = prefix
         args += ["--port", "\(port)", "--parent-pid", "\(parentPID)"]
+        if let backend, !backend.isEmpty {
+            args += ["--backend", backend]
+        }
         if let model, !model.isEmpty {
             args += ["--model", model]
+        }
+        if let chunkSeconds, chunkSeconds > 0 {
+            args += ["--chunk-seconds", String(chunkSeconds)]
         }
         return args
     }
 
-    func processArguments(port: Int, parentPID: Int32, model: String?) -> [String] {
+    func processArguments(
+        port: Int,
+        parentPID: Int32,
+        model: String?,
+        backend: String? = nil,
+        chunkSeconds: Double? = nil
+    ) -> [String] {
         Self.processArguments(
             prefix: argumentPrefix,
             port: port,
             parentPID: parentPID,
-            model: model
+            model: model,
+            backend: backend,
+            chunkSeconds: chunkSeconds
         )
     }
 

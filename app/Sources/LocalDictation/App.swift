@@ -242,11 +242,17 @@ final class DictationController {
         config: AppConfig
     ) -> (runtime: any SpeechRuntime, client: any DictationRealtimeClient) {
         switch config.provider {
-        case .voxtral:
+        case .voxtral, .parakeetMlx:
             return (ServerSupervisor(config: config), RealtimeClient(endpoint: config.websocketURL))
         case .parakeet:
             let engine = ParakeetEngine()
-            return (ParakeetRuntime(config: config, engine: engine), ParakeetRealtimeClient(engine: engine))
+            return (
+                ParakeetRuntime(config: config, engine: engine),
+                ParakeetRealtimeClient(
+                    engine: engine,
+                    chunkSeconds: config.parakeetChunkSeconds
+                )
+            )
         }
     }
 
@@ -255,7 +261,7 @@ final class DictationController {
         sharedEngine: ParakeetEngine?
     ) -> any SpeechRuntime {
         switch config.provider {
-        case .voxtral:
+        case .voxtral, .parakeetMlx:
             return ServerSupervisor(config: config)
         case .parakeet:
             return ParakeetRuntime(config: config, engine: sharedEngine ?? ParakeetEngine())
@@ -267,10 +273,13 @@ final class DictationController {
         sharedEngine: ParakeetEngine?
     ) -> any DictationRealtimeClient {
         switch config.provider {
-        case .voxtral:
+        case .voxtral, .parakeetMlx:
             return RealtimeClient(endpoint: config.websocketURL)
         case .parakeet:
-            return ParakeetRealtimeClient(engine: sharedEngine ?? ParakeetEngine())
+            return ParakeetRealtimeClient(
+                engine: sharedEngine ?? ParakeetEngine(),
+                chunkSeconds: config.parakeetChunkSeconds
+            )
         }
     }
 
@@ -799,6 +808,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var speechProviderItem: NSMenuItem!
     private var voxtralProviderItem: NSMenuItem!
     private var parakeetProviderItem: NSMenuItem!
+    private var parakeetMlxProviderItem: NSMenuItem!
     private var parakeetModelPathItem: NSMenuItem!
     private var clearParakeetPathItem: NSMenuItem!
     private var micPermissionItem: NSMenuItem!
@@ -998,10 +1008,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         parakeetProviderItem.target = self
         speechProviderMenu.addItem(parakeetProviderItem)
 
+        parakeetMlxProviderItem = NSMenuItem(
+            title: SpeechProvider.parakeetMlx.displayName,
+            action: #selector(selectParakeetMlxProvider),
+            keyEquivalent: ""
+        )
+        parakeetMlxProviderItem.target = self
+        speechProviderMenu.addItem(parakeetMlxProviderItem)
+
         speechProviderMenu.addItem(.separator())
 
         parakeetModelPathItem = NSMenuItem(
-            title: "Choose Parakeet Model Folder…",
+            title: "Choose Parakeet CoreML Model Folder…",
             action: #selector(chooseParakeetModelPath),
             keyEquivalent: ""
         )
@@ -1135,6 +1153,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func selectParakeetProvider() {
         applySpeechProvider(.parakeet)
+    }
+
+    @objc private func selectParakeetMlxProvider() {
+        applySpeechProvider(.parakeetMlx)
     }
 
     @objc private func chooseParakeetModelPath() {
@@ -1584,18 +1606,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let provider = config.provider
         voxtralProviderItem.state = provider == .voxtral ? .on : .off
         parakeetProviderItem.state = provider == .parakeet ? .on : .off
+        parakeetMlxProviderItem.state = provider == .parakeetMlx ? .on : .off
         speechProviderItem.title = "Speech Provider: \(provider.displayName)"
 
+        // CoreML folder picker only applies to the in-process CoreML path.
+        parakeetModelPathItem.isEnabled = true
         if let path = config.parakeetModelPath, !path.isEmpty {
             let display = (path as NSString).abbreviatingWithTildeInPath
-            parakeetModelPathItem.title = "Parakeet Model: \(display)"
+            parakeetModelPathItem.title = "CoreML Model: \(display)"
             clearParakeetPathItem.isEnabled = true
         } else if let resolved = ParakeetEngine.resolveModelDirectory(explicitPath: nil) {
             let display = (resolved.path as NSString).abbreviatingWithTildeInPath
-            parakeetModelPathItem.title = "Parakeet Model: \(display) (auto)"
+            parakeetModelPathItem.title = "CoreML Model: \(display) (auto)"
             clearParakeetPathItem.isEnabled = false
         } else {
-            parakeetModelPathItem.title = "Choose Parakeet Model Folder…"
+            parakeetModelPathItem.title = "Choose Parakeet CoreML Model Folder…"
             clearParakeetPathItem.isEnabled = false
         }
     }

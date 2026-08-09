@@ -524,7 +524,9 @@ final class ServerSupervisor {
         let arguments = command.processArguments(
             port: config.port,
             parentPID: ProcessInfo.processInfo.processIdentifier,
-            model: config.model
+            model: config.resolvedServerModel,
+            backend: config.serverBackendFlag,
+            chunkSeconds: config.parakeetChunkSeconds
         )
         let process = deps.makeProcess(command.executableURL, arguments)
         // ManagedProcess is @MainActor; keep handlers synchronous so activity

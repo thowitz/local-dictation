@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "local-dictation-server"
 version = "0.1.1"
 description = "Local Voxtral realtime ASR WebSocket server for local-dictation"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 dependencies = [
     "voxmlx",
     "fastapi",
@@ -22,11 +22,20 @@ packages = ["src/local_dictation_server"]
 
 [tool.uv]
 package = true
+# librosa/numba resolution can pick ancient numba pins; force modern wheels.
+override-dependencies = [
+    "numba>=0.60",
+    "llvmlite>=0.43",
+]
 
 [dependency-groups]
 dev = [
     "ruff",
     "ty",
+]
+# Optional ASR backend: `uv sync --group parakeet --python 3.12`.
+parakeet = [
+    "parakeet-mlx",
 ]
 
 [tool.ruff]

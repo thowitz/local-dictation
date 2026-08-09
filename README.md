@@ -7,9 +7,10 @@ Native, fully local dictation for macOS — a drop-in replacement for system Dic
 | Provider | Default | Runtime | Model |
 |---|---|---|---|
 | **`voxtral`** | yes | Python WebSocket server (`server/`) | Voxtral-Mini-4B-Realtime (6-bit MLX) via [voxmlx](https://github.com/awni/voxmlx) — live streaming deltas |
-| **`parakeet`** | no | In-process [FluidAudio](https://github.com/FluidInference/FluidAudio) CoreML | [Parakeet TDT 0.6B v3](https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml) — batch transcription on release/stop |
+| **`parakeet`** | no | In-process [FluidAudio](https://github.com/FluidInference/FluidAudio) CoreML | [Parakeet TDT 0.6B v3 CoreML](https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml) — periodic re-transcribe partials + finalize |
+| **`parakeet-mlx`** | no | Python WebSocket server (`parakeet-mlx`) | [mlx-community/parakeet-tdt-0.6b-v3](https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3) — streaming partials via `transcribe_stream` |
 
-The menu-bar Swift app (`app/`) always captures audio and inserts text. For `voxtral` it also supervises the Python speech runtime; for `parakeet` models load in-process (no Python required).
+The menu-bar Swift app (`app/`) always captures audio and inserts text. For `voxtral` and `parakeet-mlx` it supervises the Python speech runtime. For `parakeet` (CoreML) models load in-process (no Python for ASR).
 
 ## Install (release download)
 
@@ -168,20 +169,32 @@ A minimal override is enough (port and model default for Voxtral):
 {"serverExecutable": "/abs/path/to/serve"}
 ```
 
-To use **Parakeet** instead of Voxtral (in-process CoreML, no Python server):
+**Parakeet CoreML** (in-process, no Python ASR):
 
 ```json
 {
   "provider": "parakeet",
-  "parakeetModelPath": "~/parakeet-tdt-0.6b-v3-coreml"
+  "parakeetModelPath": "~/parakeet-tdt-0.6b-v3-coreml",
+  "parakeetChunkSeconds": 1.0
 }
 ```
 
-- `provider` (default `voxtral`): `voxtral` or `parakeet`. Edits require an **app relaunch**.
-- **Voxtral-only keys:** `serverExecutable` (absolute after `~` expansion, must be executable), `port` (default `8471`), `model` (HF id). An invalid `port` is reported rather than silently defaulted.
-- **Parakeet-only keys:** `parakeetModelPath` — optional path to a staged [FluidInference/parakeet-tdt-0.6b-v3-coreml](https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml) folder (must contain `Preprocessor.mlmodelc`, `Encoder.mlmodelc`, `Decoder.mlmodelc`, `JointDecisionv3.mlmodelc`, `parakeet_vocab.json`). A Hugging Face clone at `~/parakeet-tdt-0.6b-v3-coreml` works as-is; the app stages a FluidAudio-compatible symlink under Application Support. When omitted, the app looks for that home-folder clone, then FluidAudio’s cache under `~/Library/Application Support/FluidAudio/Models/`, then downloads via FluidAudio on first warm-up.
-- Parakeet inserts transcript text **on stop/release** (batch ASR), not token-by-token while you speak. Hold-to-talk and terminal buffer mode still apply.
-- `idleUnloadMinutes` (default `10`): minutes of inactivity with no dictation request/session before the speech runtime is unloaded to free model memory (~4 GB for Voxtral; CoreML footprint for Parakeet). Positive fractional values are allowed (useful for testing). `0` disables unload and keeps the runtime always resident. Negative values are invalid and fall back to `10` with a diagnostic. After unload the menu shows **Dormant** / Server stopped; the next mic-key or toggle start shows **Warming up…** until the runtime is ready again.
+**Parakeet MLX** (Python server, streaming):
+
+```json
+{
+  "provider": "parakeet-mlx",
+  "model": "mlx-community/parakeet-tdt-0.6b-v3",
+  "parakeetChunkSeconds": 1.0
+}
+```
+
+- `provider` (default `voxtral`): `voxtral`, `parakeet` (CoreML), or `parakeet-mlx`. Menu **Speech Provider** switches live.
+- **Python providers** (`voxtral`, `parakeet-mlx`): `serverExecutable`, `port` (default `8471`), `model` (HF id). An invalid `port` is reported rather than silently defaulted. For Parakeet MLX: `cd server && uv sync --group parakeet --python 3.12` (Python 3.12 recommended; 3.14 is not supported).
+- **CoreML keys:** `parakeetModelPath` — optional staged [FluidInference/parakeet-tdt-0.6b-v3-coreml](https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml) folder. Auto-discovers `~/parakeet-tdt-0.6b-v3-coreml` or FluidAudio cache.
+- **`parakeetChunkSeconds`** (default `1.0`): new audio duration between partial re-transcribes (CoreML) or stream steps (MLX). `0` disables CoreML partials (finalize only).
+- Parakeet partials grow the transcript while you speak when the model output keeps a stable prefix. Hold-to-talk and terminal buffer mode still apply.
+- `idleUnloadMinutes` (default `10`): minutes of inactivity before unload. `0` keeps the runtime always resident.
 
 ## Server status, errors, and recovery
 

@@ -519,9 +519,21 @@ def main():
         description="local-dictation realtime WebSocket server"
     )
     parser.add_argument(
+        "--backend",
+        choices=("voxtral", "parakeet-mlx"),
+        default="voxtral",
+        help="Speech backend: voxtral (default) or parakeet-mlx",
+    )
+    parser.add_argument(
         "--model",
-        default="mlx-community/Voxtral-Mini-4B-Realtime-6bit",
-        help="Model path or HF model ID",
+        default=None,
+        help="Model path or HF model ID (backend-specific default if omitted)",
+    )
+    parser.add_argument(
+        "--chunk-seconds",
+        type=float,
+        default=1.0,
+        help="Parakeet-mlx partial chunk size in seconds (default 1.0)",
     )
     parser.add_argument("--port", type=int, default=8471, help="Port to listen on")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")
@@ -533,6 +545,12 @@ def main():
         help="Exit when the process with this PID dies (for managed launchers).",
     )
     args = parser.parse_args()
+
+    if args.model is None:
+        if args.backend == "parakeet-mlx":
+            args.model = "mlx-community/parakeet-tdt-0.6b-v3"
+        else:
+            args.model = "mlx-community/Voxtral-Mini-4B-Realtime-6bit"
 
     logging.basicConfig(
         level=logging.INFO,
@@ -550,7 +568,12 @@ def main():
         # Own the port before model download/load so collisions fail fast.
         sock = _reserve_server_socket(args.host, args.port)
         try:
-            app = create_app(args.model, args.temp)
+            if args.backend == "parakeet-mlx":
+                from .parakeet_backend import create_parakeet_app
+
+                app = create_parakeet_app(args.model, chunk_seconds=args.chunk_seconds)
+            else:
+                app = create_app(args.model, args.temp)
         except BaseException:
             sock.close()
             raise

@@ -45,8 +45,31 @@ struct ParakeetRealtimeClientTests {
     @Test("Provider display names are stable")
     func providerDisplayNamesAreStable() {
         #expect(SpeechProvider.voxtral.displayName.contains("Voxtral"))
-        #expect(SpeechProvider.parakeet.displayName.contains("Parakeet"))
+        #expect(SpeechProvider.parakeet.displayName.contains("CoreML"))
+        #expect(SpeechProvider.parakeetMlx.displayName.contains("MLX"))
         #expect(SpeechProvider.parakeetDefaultRepoFolder == "parakeet-tdt-0.6b-v3-coreml")
+        #expect(SpeechProvider.parakeetMlxDefaultModel.contains("parakeet-tdt-0.6b-v3"))
+    }
+
+    @Test("Incremental delta only grows a stable prefix")
+    func incrementalDeltaOnlyGrowsStablePrefix() {
+        #expect(
+            ParakeetRealtimeClient.incrementalDelta(full: "hello world", previouslyEmitted: "")
+                == "hello world"
+        )
+        #expect(
+            ParakeetRealtimeClient.incrementalDelta(
+                full: "hello world",
+                previouslyEmitted: "hello "
+            ) == "world"
+        )
+        // Revision of earlier text → no conflicting insert.
+        #expect(
+            ParakeetRealtimeClient.incrementalDelta(
+                full: "hi there",
+                previouslyEmitted: "hello "
+            ) == ""
+        )
     }
 
     @Test("Staged Parakeet model loads when present on disk")
