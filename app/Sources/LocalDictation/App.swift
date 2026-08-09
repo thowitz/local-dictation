@@ -344,8 +344,18 @@ final class DictationController {
         switch state {
         case .starting, .downloading, .restarting, .unloading:
             if startIntent == .micHold {
-                if deps.isSecureEventInputEnabled() || !deps.isAccessibilityTrusted() {
+                if deps.isSecureEventInputEnabled() {
                     intent.clearAll()
+                    let message = "Secure input is enabled — dictation refused."
+                    AppLog.general.error("\(message, privacy: .public)")
+                    transition(to: .failed(.secureInput(message)))
+                    return
+                }
+                if !deps.isAccessibilityTrusted() {
+                    intent.clearAll()
+                    let message = "Accessibility permission required — grant it in System Settings."
+                    AppLog.general.error("\(message, privacy: .public)")
+                    transition(to: .failed(.accessibility(message)))
                     return
                 }
                 intent.queue(.micHold)
