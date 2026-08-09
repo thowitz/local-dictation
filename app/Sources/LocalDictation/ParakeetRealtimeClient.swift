@@ -261,11 +261,20 @@ final class ParakeetRealtimeClient: DictationRealtimeClient, @unchecked Sendable
 
         do {
             let text = try await engine.transcribe(pcm16: pcm)
-            let delta = Self.incrementalDelta(full: text, previouslyEmitted: previouslyEmitted)
+            // Use the latest emitted baseline (partials may have advanced it).
+            let baseline = client.state.withLock { s -> String in
+                guard s.sessionID == sessionID else { return previouslyEmitted }
+                return s.emittedText
+            }
+            let delta = Self.incrementalDelta(full: text, previouslyEmitted: baseline)
             let snapshot = client.state.withLock { s -> (stillCurrent: Bool, callbacks: RealtimeClient.Callbacks) in
                 let still = s.sessionID == sessionID && s.connectionState == .connected
                 if still {
-                    s.emittedText = text
+                    // Reset utterance state so the next hold session starts clean.
+                    // Leaving emittedText set was the multi-session bug: second
+                    // commit computed an empty delta against the first transcript.
+                    s.emittedText = ""
+                    s.lastPartialByteCount = 0
                     s.partialInFlight = false
                 }
                 return (still, s.callbacks)
@@ -282,7 +291,11 @@ final class ParakeetRealtimeClient: DictationRealtimeClient, @unchecked Sendable
         } catch {
             let snapshot = client.state.withLock { s -> (stillCurrent: Bool, callbacks: RealtimeClient.Callbacks) in
                 let still = s.sessionID == sessionID && s.connectionState == .connected
-                if still { s.partialInFlight = false }
+                if still {
+                    s.emittedText = ""
+                    s.lastPartialByteCount = 0
+                    s.partialInFlight = false
+                }
                 return (still, s.callbacks)
             }
             guard snapshot.stillCurrent else { return }

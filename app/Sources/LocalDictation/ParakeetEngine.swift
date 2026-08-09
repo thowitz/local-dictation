@@ -217,6 +217,9 @@ actor ParakeetEngine {
         }
 
         do {
+            // Fresh decoder state per call; also clear FluidAudio scratch caches so
+            // successive utterances do not share residual encoder/decoder state.
+            await asrManager.reset()
             let layers = await asrManager.decoderLayerCount
             var decoderState = TdtDecoderState.make(decoderLayers: layers)
             let result = try await asrManager.transcribe(samples, decoderState: &decoderState)

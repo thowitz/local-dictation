@@ -104,6 +104,72 @@ struct ParakeetPartialsIntegrationTests {
         await engine.unload()
     }
 
+    @Test("Second utterance still emits text after first commit")
+    func secondUtteranceStillEmits() async throws {
+        guard let modelDir = ParakeetEngine.resolveModelDirectory(explicitPath: nil) else {
+            return
+        }
+        guard commandExists("say"), commandExists("afconvert") else {
+            return
+        }
+
+        let engine = ParakeetEngine()
+        try await engine.load(directory: modelDir)
+        let client = ParakeetRealtimeClient(engine: engine, chunkSeconds: 0) // finalize-only
+        let collector = DeltaCollector()
+        client.setCallbacks(
+            RealtimeClient.Callbacks(
+                onDelta: { delta in collector.appendDelta(delta) },
+                onDone: { text in collector.markDone(text) },
+                onError: { message in collector.markError(message) }
+            )
+        )
+        client.connect()
+        for _ in 0..<100 {
+            if client.isConnected { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(client.isConnected)
+
+        // Utterance 1
+        let pcm1 = try pcm16Data(from: try synthesizeWAV(text: "alpha bravo charlie"))
+        client.sendAudio(pcm1)
+        #expect(client.commitFinal())
+        for _ in 0..<200 {
+            if collector.isDone || collector.errorMessage != nil { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(collector.errorMessage == nil, "first utterance error: \(collector.errorMessage ?? "")")
+        #expect(collector.isDone)
+        let first = (collector.doneText ?? collector.joinedDeltas).lowercased()
+        #expect(!first.isEmpty, "first utterance empty")
+
+        // Reset collector for utterance 2 (simulates next hold session)
+        collector.resetForNextUtterance()
+
+        let pcm2 = try pcm16Data(from: try synthesizeWAV(text: "delta echo foxtrot"))
+        client.sendAudio(pcm2)
+        #expect(client.commitFinal())
+        for _ in 0..<200 {
+            if collector.isDone || collector.errorMessage != nil { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(collector.errorMessage == nil, "second utterance error: \(collector.errorMessage ?? "")")
+        #expect(collector.isDone, "second commit never delivered onDone")
+        let second = (collector.doneText ?? collector.joinedDeltas).lowercased()
+        #expect(
+            !second.isEmpty,
+            "second utterance produced no text — multi-session emittedText leak"
+        )
+        // Prefer some content signal from the second phrase.
+        let hits = ["delta", "echo", "foxtrot", "delta", "echo"].filter { second.contains($0) }
+        // Soft: non-empty is the hard requirement; hits are best-effort ASR.
+        _ = hits
+
+        client.disconnect()
+        await engine.unload()
+    }
+
     private static func shareLongPrefix(_ a: String, _ b: String) -> Int {
         a.commonPrefix(with: b).count
     }
@@ -147,6 +213,14 @@ private final class DeltaCollector: @unchecked Sendable {
     func markError(_ message: String) {
         lock.lock()
         errorMessage = message
+        lock.unlock()
+    }
+
+    func resetForNextUtterance() {
+        lock.lock()
+        deltas = []
+        doneText = nil
+        errorMessage = nil
         lock.unlock()
     }
 }

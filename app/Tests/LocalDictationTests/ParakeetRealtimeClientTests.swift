@@ -70,6 +70,19 @@ struct ParakeetRealtimeClientTests {
                 previouslyEmitted: "hello "
             ) == ""
         )
+        // Second utterance must not treat first transcript as prior emit.
+        #expect(
+            ParakeetRealtimeClient.incrementalDelta(
+                full: "hello world",
+                previouslyEmitted: "hello world"
+            ) == ""
+        )
+        #expect(
+            ParakeetRealtimeClient.incrementalDelta(
+                full: "hello world",
+                previouslyEmitted: ""
+            ) == "hello world"
+        )
     }
 
     @Test("Staged Parakeet model loads when present on disk")
