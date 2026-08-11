@@ -4,9 +4,9 @@ import Foundation
 enum SpeechProvider: String, Codable, Sendable, CaseIterable {
     /// Python WebSocket server with MLX Voxtral realtime.
     case voxtral
-    /// In-process FluidAudio Parakeet TDT 0.6B v3 CoreML (chunked re-transcribe).
+    /// In-process FluidAudio Parakeet TDT 0.6B v3 CoreML (sliding-window partials).
     case parakeet
-    /// Python WebSocket server with parakeet-mlx (streaming partials).
+    /// Python WebSocket server with parakeet-mlx (true streaming partials).
     case parakeetMlx = "parakeet-mlx"
 
     var displayName: String {
@@ -25,8 +25,11 @@ enum SpeechProvider: String, Codable, Sendable, CaseIterable {
         }
     }
 
-    /// Hugging Face clone folder name (common user staging path for CoreML).
+    /// Hugging Face clone folder name for Parakeet TDT v3 CoreML models.
     static let parakeetDefaultRepoFolder = "parakeet-tdt-0.6b-v3-coreml"
+
+    /// Common clone folder name for mlx-community Parakeet TDT weights (no `-coreml`).
+    static let parakeetMlxDefaultRepoFolder = "parakeet-tdt-0.6b-v3"
 
     /// Default HF id for the MLX Parakeet weights.
     static let parakeetMlxDefaultModel = "mlx-community/parakeet-tdt-0.6b-v3"

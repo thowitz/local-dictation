@@ -7,8 +7,8 @@ Native, fully local dictation for macOS — a drop-in replacement for system Dic
 | Provider | Default | Runtime | Model |
 |---|---|---|---|
 | **`voxtral`** | yes | Python WebSocket server (`server/`) | Voxtral-Mini-4B-Realtime (6-bit MLX) via [voxmlx](https://github.com/awni/voxmlx) — live streaming deltas |
-| **`parakeet`** | no | In-process [FluidAudio](https://github.com/FluidInference/FluidAudio) CoreML | [Parakeet TDT 0.6B v3 CoreML](https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml) — periodic re-transcribe partials + finalize |
-| **`parakeet-mlx`** | no | Python WebSocket server (`parakeet-mlx`) | [mlx-community/parakeet-tdt-0.6b-v3](https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3) — streaming partials via `transcribe_stream` |
+| **`parakeet`** | no | In-process [FluidAudio](https://github.com/FluidInference/FluidAudio) CoreML | [Parakeet TDT 0.6B v3 CoreML](https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml) — sliding-window partials (`SlidingWindowAsrManager`, short dictation windows) |
+| **`parakeet-mlx`** | no | Python WebSocket server (`parakeet-mlx`) | [mlx-community/parakeet-tdt-0.6b-v3](https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3) — true streaming via `transcribe_stream` (often snappier partials on Apple Silicon) |
 
 The menu-bar Swift app (`app/`) always captures audio and inserts text. For `voxtral` and `parakeet-mlx` it supervises the Python speech runtime. For `parakeet` (CoreML) models load in-process (no Python for ASR).
 
@@ -169,31 +169,36 @@ A minimal override is enough (port and model default for Voxtral):
 {"serverExecutable": "/abs/path/to/serve"}
 ```
 
-**Parakeet CoreML** (in-process, no Python ASR):
+**Parakeet TDT v3 CoreML** (in-process sliding-window partials, no Python ASR):
 
 ```json
 {
   "provider": "parakeet",
   "parakeetModelPath": "~/parakeet-tdt-0.6b-v3-coreml",
-  "parakeetChunkSeconds": 1.0
+  "parakeetChunkSeconds": 0.75
 }
 ```
+
+`parakeetChunkSeconds` is the sliding-window **center stride** (FluidAudio default is ~11 s for long-form; we use a short dictation window so partials appear while you hold). Smaller → more frequent partials; first update after roughly `chunk + ~0.3 s` of audio.
 
 **Parakeet MLX** (Python server, streaming):
 
 ```json
 {
   "provider": "parakeet-mlx",
-  "model": "mlx-community/parakeet-tdt-0.6b-v3",
-  "parakeetChunkSeconds": 1.0
+  "parakeetMlxModelPath": "~/parakeet-tdt-0.6b-v3",
+  "parakeetChunkSeconds": 0.5
 }
 ```
 
+Or use a Hugging Face id instead of a local path: `"model": "mlx-community/parakeet-tdt-0.6b-v3"`.
+
 - `provider` (default `voxtral`): `voxtral`, `parakeet` (CoreML), or `parakeet-mlx`. Menu **Speech Provider** switches live.
 - **Python providers** (`voxtral`, `parakeet-mlx`): `serverExecutable`, `port` (default `8471`), `model` (HF id). An invalid `port` is reported rather than silently defaulted. For Parakeet MLX: `cd server && uv sync --group parakeet --python 3.12` (Python 3.12 recommended; 3.14 is not supported).
-- **CoreML keys:** `parakeetModelPath` — optional staged [FluidInference/parakeet-tdt-0.6b-v3-coreml](https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml) folder. Auto-discovers `~/parakeet-tdt-0.6b-v3-coreml` or FluidAudio cache.
-- **`parakeetChunkSeconds`** (default `1.0`): new audio duration between partial re-transcribes (CoreML) or stream steps (MLX). `0` disables CoreML partials (finalize only).
-- Parakeet partials grow the transcript while you speak when the model output keeps a stable prefix. Hold-to-talk and terminal buffer mode still apply.
+- **CoreML keys:** `parakeetModelPath` — optional staged [FluidInference/parakeet-tdt-0.6b-v3-coreml](https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml) folder. Auto-discovers `~/parakeet-tdt-0.6b-v3-coreml` or FluidAudio cache. Menu: **Choose Parakeet CoreML Model Folder…**
+- **MLX keys:** `parakeetMlxModelPath` — optional staged [mlx-community/parakeet-tdt-0.6b-v3](https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3) folder (e.g. `~/parakeet-tdt-0.6b-v3`). Passed as `--model` so loads stay offline. Auto-discovers that home path; otherwise falls back to `model` / the default HF id. Menu: **Choose Parakeet MLX Model Folder…**
+- **`parakeetChunkSeconds`** (default `0.75`): CoreML sliding-window stride / MLX `transcribe_stream` step. Lower = snappier partials.
+- CoreML TDT uses overlapping windows (not EOU). MLX uses true streaming and is often the lower-latency partials path if you have the Python env set up. Hold-to-talk and terminal buffer mode still apply.
 - `idleUnloadMinutes` (default `10`): minutes of inactivity before unload. `0` keeps the runtime always resident.
 
 ## Server status, errors, and recovery

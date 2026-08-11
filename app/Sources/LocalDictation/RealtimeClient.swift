@@ -11,7 +11,9 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
     }
 
     struct Callbacks: Sendable {
-        var onDelta: (@Sendable (String) -> Void)?
+        /// Incremental append (Voxtral) or absolute draft snapshot (Parakeet MLX).
+        /// `absolute == true` means `text` is the full transcript so far and may revise.
+        var onDelta: (@Sendable (_ text: String, _ absolute: Bool) -> Void)?
         var onDone: (@Sendable (String) -> Void)?
         var onConnectionState: (@Sendable (ConnectionState) -> Void)?
         var onError: (@Sendable (String) -> Void)?
@@ -135,7 +137,13 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
         task.receive { [weak self] result in
             guard let self else { return }
             self.lock.lock()
-            let isCurrent = self.task === task && self.connectionState == .connected
+            // Accept frames while connecting *or* connected. Server often sends
+            // `session.created` before URLSession fires didOpenWithProtocol; if we
+            // drop that receive without re-arming, the socket goes silent and the
+            // UI flaps Ready ↔ Warming up on reconnect.
+            let isCurrent =
+                self.task === task
+                && (self.connectionState == .connected || self.connectionState == .connecting)
             self.lock.unlock()
             guard isCurrent else { return }
 
@@ -174,7 +182,8 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
         case "response.audio_transcript.delta",
              "transcription.delta":
             if let delta = json["delta"] as? String ?? json["text"] as? String ?? json["transcript"] as? String {
-                cbs.onDelta?(delta)
+                let absolute = (json["absolute"] as? Bool) ?? false
+                cbs.onDelta?(delta, absolute)
             }
         case "response.audio_transcript.done",
              "transcription.done":
@@ -185,6 +194,9 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
             cbs.onDone?(transcript)
         case "input_audio_buffer.cleared":
             cbs.onBufferCleared?()
+        case "session.created", "session.updated":
+            // Protocol handshake — no client action required.
+            break
         case "error":
             let message = (json["message"] as? String)
                 ?? (json["error"] as? String)

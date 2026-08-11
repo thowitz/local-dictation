@@ -1,46 +1,36 @@
 import Foundation
 import os
 
-/// In-process realtime client for Parakeet TDT (CoreML).
+/// In-process realtime client for Parakeet **TDT 0.6B** sliding-window partials.
 ///
 /// Speaks the same `DictationRealtimeClient` surface as the WebSocket client:
-/// - `connect` / `disconnect` track model readiness (no socket)
-/// - `sendAudio` buffers 16 kHz PCM16 and runs periodic partial re-transcribes
-/// - `commitFinal` re-transcribes the full buffer and emits remaining delta + done
-/// - `clearBuffer` discards audio (cancellation)
-///
-/// Partials re-transcribe the full utterance so far, then emit only the text
-/// suffix beyond the last emitted prefix (safe for insert-only text paths).
+/// - `connect` / `disconnect` track model readiness
+/// - `sendAudio` feeds PCM into FluidAudio `SlidingWindowAsrManager`
+/// - partials arrive as confirmed/volatile text grows (insert deltas only)
+/// - `commitFinal` finishes the stream and emits remaining delta + done
+/// - `clearBuffer` cancels the stream
 final class ParakeetRealtimeClient: DictationRealtimeClient, @unchecked Sendable {
     private struct State: Sendable {
         var callbacks = RealtimeClient.Callbacks()
         var connectionState: RealtimeClient.ConnectionState = .disconnected
-        var audioBuffer = Data()
         var sessionID = UUID()
-        /// Full transcript text already delivered as deltas this session.
         var emittedText = ""
-        /// Audio byte count when the last partial was scheduled.
-        var lastPartialByteCount = 0
-        var partialInFlight = false
+        var finalizing = false
+        var generation: UInt64 = 0
+        var utteranceStarted = false
     }
 
     private let engine: ParakeetEngine
-    /// Minimum new PCM16 bytes before a partial re-transcribe (default ~1 s at 16 kHz mono).
-    private let chunkBytes: Int
+    private let chunkSeconds: Double
     private let state = OSAllocatedUnfairLock(initialState: State())
-    private let workGate = OSAllocatedUnfairLock(initialState: Optional<Task<Void, Never>>.none)
+    private let feedQueue = OSAllocatedUnfairLock(initialState: Optional<Task<Void, Never>>.none)
 
     /// - Parameters:
-    ///   - engine: Shared Parakeet engine.
-    ///   - chunkSeconds: New audio duration that triggers a partial. `0` disables partials.
-    init(engine: ParakeetEngine, chunkSeconds: Double = 1.0) {
+    ///   - engine: Shared Parakeet TDT engine.
+    ///   - chunkSeconds: Sliding-window center stride (mapped to FluidAudio chunkSeconds).
+    init(engine: ParakeetEngine, chunkSeconds: Double = 1.5) {
         self.engine = engine
-        if chunkSeconds <= 0 {
-            self.chunkBytes = Int.max
-        } else {
-            // 16 kHz mono Int16 → 2 bytes/sample.
-            self.chunkBytes = max(1, Int(chunkSeconds * 16_000 * 2))
-        }
+        self.chunkSeconds = chunkSeconds > 0 ? chunkSeconds : 1.5
     }
 
     var isConnected: Bool {
@@ -52,16 +42,13 @@ final class ParakeetRealtimeClient: DictationRealtimeClient, @unchecked Sendable
     }
 
     func connect() {
-        workGate.withLock { task in
-            task?.cancel()
-            task = nil
-        }
+        cancelFeedWork()
         let connectingCallbacks: RealtimeClient.Callbacks = state.withLock { s in
             s.sessionID = UUID()
-            s.audioBuffer.removeAll(keepingCapacity: true)
             s.emittedText = ""
-            s.lastPartialByteCount = 0
-            s.partialInFlight = false
+            s.finalizing = false
+            s.utteranceStarted = false
+            s.generation &+= 1
             s.connectionState = .connecting
             return s.callbacks
         }
@@ -69,14 +56,23 @@ final class ParakeetRealtimeClient: DictationRealtimeClient, @unchecked Sendable
 
         Task { [weak self] in
             guard let self else { return }
+            await self.engine.setChunkSeconds(self.chunkSeconds)
             let ready = await self.engine.isReady()
             if ready {
+                await self.engine.setPartialHandler { [weak self] full in
+                    self?.handlePartialTranscript(full)
+                }
                 let cbs = self.state.withLock { s -> RealtimeClient.Callbacks in
                     s.connectionState = .connected
+                    s.emittedText = ""
+                    s.finalizing = false
+                    s.utteranceStarted = false
                     return s.callbacks
                 }
                 cbs.onConnectionState?(.connected)
-                AppLog.realtime.info("Parakeet realtime client connected (in-process, chunked)")
+                AppLog.realtime.info(
+                    "Parakeet TDT realtime client connected (sliding-window chunk=\(self.chunkSeconds, privacy: .public)s)"
+                )
             } else {
                 let cbs = self.state.withLock { s -> RealtimeClient.Callbacks in
                     s.connectionState = .disconnected
@@ -84,92 +80,123 @@ final class ParakeetRealtimeClient: DictationRealtimeClient, @unchecked Sendable
                 }
                 cbs.onConnectionState?(.disconnected)
                 cbs.onError?("Parakeet models are not ready.")
-                AppLog.realtime.error("Parakeet connect failed — models not ready")
+                AppLog.realtime.error("Parakeet TDT connect failed — models not ready")
             }
         }
     }
 
     func disconnect() {
-        workGate.withLock { task in
-            task?.cancel()
-            task = nil
-        }
-        let result: (alreadyDisconnected: Bool, callbacks: RealtimeClient.Callbacks) = state.withLock { s in
-            let already = s.connectionState == .disconnected
-            s.sessionID = UUID()
-            s.audioBuffer.removeAll(keepingCapacity: false)
+        cancelFeedWork()
+        state.withLock { s in
+            s.generation &+= 1
+            s.utteranceStarted = false
+            s.finalizing = false
             s.emittedText = ""
-            s.lastPartialByteCount = 0
-            s.partialInFlight = false
+            s.sessionID = UUID()
             s.connectionState = .disconnected
-            return (already, s.callbacks)
         }
-        if !result.alreadyDisconnected {
-            result.callbacks.onConnectionState?(.disconnected)
+        Task { [weak self] in
+            await self?.engine.setPartialHandler(nil)
+            await self?.engine.cancelUtterance()
         }
-        AppLog.realtime.info("Parakeet realtime client disconnected")
+        // onConnectionState disconnected once
+        let cbs = state.withLock { $0.callbacks }
+        cbs.onConnectionState?(.disconnected)
+        AppLog.realtime.info("Parakeet TDT realtime client disconnected")
     }
 
     func sendAudio(_ pcm16: Data) {
         guard !pcm16.isEmpty else { return }
-        let shouldPartial: Bool = state.withLock { s in
-            guard s.connectionState == .connected else { return false }
-            s.audioBuffer.append(pcm16)
-            let newBytes = s.audioBuffer.count - s.lastPartialByteCount
-            return !s.partialInFlight && newBytes >= chunkBytes && chunkBytes != Int.max
+        let snapshot: (connected: Bool, finalizing: Bool, generation: UInt64) = state.withLock { s in
+            (s.connectionState == .connected, s.finalizing, s.generation)
         }
-        if shouldPartial {
-            schedulePartial()
+        guard snapshot.connected, !snapshot.finalizing else { return }
+
+        let previous = feedQueue.withLock { $0 }
+        let generation = snapshot.generation
+        let task = Task { [weak self] in
+            if let previous {
+                await previous.value
+            }
+            guard let self, !Task.isCancelled else { return }
+            let still = self.state.withLock { s in
+                s.connectionState == .connected && s.generation == generation
+            }
+            guard still else { return }
+
+            // Start stream on first audio of this hold.
+            let needStart = self.state.withLock { s -> Bool in
+                if s.utteranceStarted { return false }
+                s.utteranceStarted = true
+                s.emittedText = ""
+                return true
+            }
+            do {
+                if needStart {
+                    try await self.engine.beginUtterance()
+                }
+                try await self.engine.processAudio(pcm16: pcm16)
+            } catch {
+                if !Task.isCancelled {
+                    AppLog.realtime.error(
+                        "Parakeet TDT process failed: \(error.localizedDescription, privacy: .public)"
+                    )
+                }
+            }
         }
+        feedQueue.withLock { $0 = task }
     }
 
     @discardableResult
     func commitFinal() -> Bool {
-        let snapshot: (pcm: Data, sessionID: UUID, emitted: String, connected: Bool) = state.withLock { s in
+        let snapshot: (connected: Bool, sessionID: UUID, emitted: String) = state.withLock { s in
             guard s.connectionState == .connected else {
-                return (Data(), s.sessionID, s.emittedText, false)
+                return (false, s.sessionID, s.emittedText)
             }
-            let pcm = s.audioBuffer
-            s.audioBuffer.removeAll(keepingCapacity: true)
-            s.lastPartialByteCount = 0
-            s.partialInFlight = true // block concurrent partials
-            return (pcm, s.sessionID, s.emittedText, true)
+            s.finalizing = true
+            return (true, s.sessionID, s.emittedText)
         }
         guard snapshot.connected else { return false }
 
-        let engine = self.engine
-        let sessionID = snapshot.sessionID
-        let pcm = snapshot.pcm
-        let previouslyEmitted = snapshot.emitted
+        let previous = feedQueue.withLock { $0 }
         let task = Task { [weak self] in
+            if let previous {
+                let completed = await Self.awaitWithTimeout(previous, timeoutMs: 8_000)
+                if !completed {
+                    previous.cancel()
+                    AppLog.realtime.error("Parakeet TDT feed drain timed out before commit")
+                }
+            }
+            guard let self else { return }
+            let generation = self.state.withLock { s -> UInt64 in
+                s.generation &+= 1
+                return s.generation
+            }
             await Self.runCommit(
                 client: self,
-                engine: engine,
-                pcm: pcm,
-                sessionID: sessionID,
-                previouslyEmitted: previouslyEmitted
+                engine: self.engine,
+                sessionID: snapshot.sessionID,
+                previouslyEmitted: snapshot.emitted,
+                generation: generation
             )
         }
-        workGate.withLock { current in
-            current?.cancel()
-            current = task
-        }
+        feedQueue.withLock { $0 = task }
         return true
     }
 
     @discardableResult
     func clearBuffer() -> Bool {
-        workGate.withLock { task in
-            task?.cancel()
-            task = nil
-        }
+        cancelFeedWork()
         let cbs = state.withLock { s -> RealtimeClient.Callbacks in
-            s.audioBuffer.removeAll(keepingCapacity: true)
             s.emittedText = ""
-            s.lastPartialByteCount = 0
-            s.partialInFlight = false
+            s.finalizing = false
+            s.utteranceStarted = false
+            s.generation &+= 1
             s.sessionID = UUID()
             return s.callbacks
+        }
+        Task { [weak self] in
+            await self?.engine.cancelUtterance()
         }
         cbs.onBufferCleared?()
         return true
@@ -177,91 +204,61 @@ final class ParakeetRealtimeClient: DictationRealtimeClient, @unchecked Sendable
 
     // MARK: - Partials
 
-    private func schedulePartial() {
-        let snapshot: (pcm: Data, sessionID: UUID, emitted: String)? = state.withLock { s in
-            guard s.connectionState == .connected, !s.partialInFlight else { return nil }
-            s.partialInFlight = true
-            s.lastPartialByteCount = s.audioBuffer.count
-            return (s.audioBuffer, s.sessionID, s.emittedText)
-        }
-        guard let snapshot else { return }
+    private func handlePartialTranscript(_ full: String) {
+        let trimmed = full.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
 
-        let engine = self.engine
-        let task = Task { [weak self] in
-            await Self.runPartial(
-                client: self,
-                engine: engine,
-                pcm: snapshot.pcm,
-                sessionID: snapshot.sessionID,
-                previouslyEmitted: snapshot.emitted
-            )
-        }
-        workGate.withLock { current in
-            // Do not cancel an in-flight commit; partials are best-effort.
-            if current == nil || current?.isCancelled == true {
-                current = task
+        let snapshot = state.withLock { s -> (still: Bool, delta: String, callbacks: RealtimeClient.Callbacks) in
+            guard s.connectionState == .connected, !s.finalizing else {
+                return (false, "", s.callbacks)
             }
+            let delta = Self.incrementalDelta(full: trimmed, previouslyEmitted: s.emittedText)
+            if !delta.isEmpty {
+                s.emittedText += delta
+            }
+            return (true, delta, s.callbacks)
+        }
+        guard snapshot.still, !snapshot.delta.isEmpty else { return }
+        snapshot.callbacks.onDelta?(snapshot.delta, false)
+        AppLog.realtime.info(
+            "Parakeet TDT partial delta chars=\(snapshot.delta.count, privacy: .public) full=\(trimmed.count, privacy: .public)"
+        )
+    }
+
+    private func cancelFeedWork() {
+        feedQueue.withLock { task in
+            task?.cancel()
+            task = nil
         }
     }
 
-    private static func runPartial(
-        client: ParakeetRealtimeClient?,
-        engine: ParakeetEngine,
-        pcm: Data,
-        sessionID: UUID,
-        previouslyEmitted: String
-    ) async {
-        guard let client else { return }
-        defer {
-            client.state.withLock { s in
-                if s.sessionID == sessionID {
-                    s.partialInFlight = false
-                }
+    private static func awaitWithTimeout(_ task: Task<Void, Never>, timeoutMs: UInt64) async -> Bool {
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await task.value
+                return true
             }
-        }
-
-        do {
-            let text = try await engine.transcribe(pcm16: pcm)
-            // Read the latest emitted text in case another partial already advanced it.
-            let baseline = client.state.withLock { s -> String in
-                guard s.sessionID == sessionID else { return previouslyEmitted }
-                return s.emittedText
+            group.addTask {
+                try? await Task.sleep(nanoseconds: timeoutMs * 1_000_000)
+                return false
             }
-            let delta = Self.incrementalDelta(full: text, previouslyEmitted: baseline)
-            let snapshot = client.state.withLock { s -> (stillCurrent: Bool, callbacks: RealtimeClient.Callbacks) in
-                let still = s.sessionID == sessionID && s.connectionState == .connected
-                if still, !delta.isEmpty {
-                    s.emittedText = baseline + delta
-                }
-                return (still, s.callbacks)
-            }
-            guard snapshot.stillCurrent else { return }
-            if !delta.isEmpty {
-                snapshot.callbacks.onDelta?(delta)
-                AppLog.realtime.info(
-                    "Parakeet partial delta chars=\(delta.count, privacy: .public) full=\(text.count, privacy: .public)"
-                )
-            }
-        } catch {
-            // Partials are best-effort; log and continue listening.
-            AppLog.realtime.error(
-                "Parakeet partial failed: \(error.localizedDescription, privacy: .public)"
-            )
+            let finished = await group.next() ?? false
+            group.cancelAll()
+            return finished
         }
     }
 
     private static func runCommit(
         client: ParakeetRealtimeClient?,
         engine: ParakeetEngine,
-        pcm: Data,
         sessionID: UUID,
-        previouslyEmitted: String
+        previouslyEmitted: String,
+        generation: UInt64
     ) async {
         guard let client else { return }
 
         do {
-            let text = try await engine.transcribe(pcm16: pcm)
-            // Use the latest emitted baseline (partials may have advanced it).
+            let text = try await engine.finishUtterance()
             let baseline = client.state.withLock { s -> String in
                 guard s.sessionID == sessionID else { return previouslyEmitted }
                 return s.emittedText
@@ -269,46 +266,43 @@ final class ParakeetRealtimeClient: DictationRealtimeClient, @unchecked Sendable
             let delta = Self.incrementalDelta(full: text, previouslyEmitted: baseline)
             let snapshot = client.state.withLock { s -> (stillCurrent: Bool, callbacks: RealtimeClient.Callbacks) in
                 let still = s.sessionID == sessionID && s.connectionState == .connected
+                    && s.generation == generation
                 if still {
-                    // Reset utterance state so the next hold session starts clean.
-                    // Leaving emittedText set was the multi-session bug: second
-                    // commit computed an empty delta against the first transcript.
                     s.emittedText = ""
-                    s.lastPartialByteCount = 0
-                    s.partialInFlight = false
+                    s.finalizing = false
+                    s.utteranceStarted = false
+                    s.generation &+= 1
                 }
                 return (still, s.callbacks)
             }
             guard snapshot.stillCurrent else { return }
 
             if !delta.isEmpty {
-                snapshot.callbacks.onDelta?(delta)
+                snapshot.callbacks.onDelta?(delta, false)
             }
             snapshot.callbacks.onDone?(text)
             AppLog.realtime.info(
-                "Parakeet commit complete — chars=\(text.count, privacy: .public) pcmBytes=\(pcm.count, privacy: .public) remainingDelta=\(delta.count, privacy: .public)"
+                "Parakeet TDT commit complete — chars=\(text.count, privacy: .public) remainingDelta=\(delta.count, privacy: .public)"
             )
         } catch {
             let snapshot = client.state.withLock { s -> (stillCurrent: Bool, callbacks: RealtimeClient.Callbacks) in
                 let still = s.sessionID == sessionID && s.connectionState == .connected
                 if still {
                     s.emittedText = ""
-                    s.lastPartialByteCount = 0
-                    s.partialInFlight = false
+                    s.finalizing = false
+                    s.utteranceStarted = false
+                    s.generation &+= 1
                 }
                 return (still, s.callbacks)
             }
             guard snapshot.stillCurrent else { return }
             AppLog.realtime.error(
-                "Parakeet commit failed: \(error.localizedDescription, privacy: .public)"
+                "Parakeet TDT commit failed: \(error.localizedDescription, privacy: .public)"
             )
             snapshot.callbacks.onError?(error.localizedDescription)
         }
     }
 
-    /// Returns text that can be appended after `previouslyEmitted` when the model
-    /// re-transcribes a growing utterance. Only emits when the new full text
-    /// still starts with the prior emit (insert-only text paths cannot revise).
     static func incrementalDelta(full: String, previouslyEmitted: String) -> String {
         if previouslyEmitted.isEmpty {
             return full
@@ -316,12 +310,7 @@ final class ParakeetRealtimeClient: DictationRealtimeClient, @unchecked Sendable
         if full.hasPrefix(previouslyEmitted) {
             return String(full.dropFirst(previouslyEmitted.count))
         }
-        // Model revised earlier words — do not emit a conflicting prefix.
-        // On commit the caller still gets the full text via onDone for logging.
-        let common = full.commonPrefix(with: previouslyEmitted)
-        if common.count >= previouslyEmitted.count {
-            return String(full.dropFirst(previouslyEmitted.count))
-        }
+        // Volatile revision — do not fight the insert path.
         return ""
     }
 }

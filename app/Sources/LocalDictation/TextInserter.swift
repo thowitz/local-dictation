@@ -6,22 +6,24 @@ import os
 
 /// Inserts dictated text at the caret via synthetic Unicode keyboard events.
 ///
-/// Two modes, chosen once at dictation start from the then-frontmost target:
-/// - **stream**: each transcript delta is typed immediately.
-/// - **buffer**: deltas accumulate; on stop the buffer is sanitized (newlines/tabs
-///   → spaces) and inserted once. Used for terminal-like targets where live
-///   streaming risks submitting a shell prompt.
+/// Always streams live. Terminal-like targets (Terminal, iTerm, shells, etc.)
+/// strip newlines/tabs to spaces on insert so a mid-stream line break cannot
+/// submit a shell command, while still showing partials as you speak.
 @MainActor
 final class TextInserter {
     enum Mode: String, Sendable {
         case stream
+        /// Legacy: accumulate until stop. Unused — terminals stream with
+        /// line-break stripping instead.
         case buffer
     }
 
     private(set) var mode: Mode = .stream
+    /// When true, `\n` / `\r` / `\t` become spaces before any keystroke is posted.
+    private(set) var stripLineBreaks = false
     private var buffer = ""
 
-    /// Exact bundle IDs treated as terminal emulators (PLAN step 3 / fact #5).
+    /// Exact bundle IDs treated as terminal emulators.
     private static let terminalBundleIDs: Set<String> = [
         "com.apple.Terminal",
         "com.googlecode.iterm2",
@@ -44,29 +46,35 @@ final class TextInserter {
 
     // MARK: - Session
 
-    /// Probe the frontmost target and arm stream or buffer mode.
+    /// Probe the frontmost target and arm stream + optional line-break stripping.
     func beginSession() {
         buffer = ""
         let decision = Self.detectTerminalLikeTarget()
-        mode = decision.isTerminalLike ? .buffer : .stream
+        mode = .stream
+        stripLineBreaks = decision.isTerminalLike
         AppLog.insertion.info(
-            "insertion mode=\(self.mode.rawValue, privacy: .public) terminalLike=\(decision.isTerminalLike, privacy: .public) reason=\(decision.reason, privacy: .public) bundle=\(decision.bundleID ?? "<none>", privacy: .public)"
+            "insertion mode=\(self.mode.rawValue, privacy: .public) stripLineBreaks=\(self.stripLineBreaks, privacy: .public) terminalLike=\(decision.isTerminalLike, privacy: .public) reason=\(decision.reason, privacy: .public) bundle=\(decision.bundleID ?? "<none>", privacy: .public)"
         )
     }
 
-    /// Route a transcript delta according to the session mode.
+    /// Normalize text the same way keystrokes will (so session tracking matches).
+    func prepared(_ text: String) -> String {
+        stripLineBreaks ? Self.sanitizeForTerminal(text) : text
+    }
+
+    /// Route a transcript delta (append-only, e.g. Voxtral).
     func handleDelta(_ text: String) {
-        guard !text.isEmpty else { return }
+        let chunk = prepared(text)
+        guard !chunk.isEmpty else { return }
         switch mode {
         case .stream:
-            _ = insert(text)
+            _ = insert(chunk)
         case .buffer:
-            buffer.append(text)
+            buffer.append(chunk)
         }
     }
 
-    /// Buffer-mode stop path: sanitize and insert the accumulated text once.
-    /// Stream mode has already typed deltas live; this is a no-op there.
+    /// Buffer-mode stop path (legacy). Stream mode is a no-op.
     @discardableResult
     func flush() -> String {
         switch mode {
@@ -80,6 +88,104 @@ final class TextInserter {
                 _ = insert(sanitized)
             }
             return sanitized
+        }
+    }
+
+    /// Apply a live absolute draft (Parakeet MLX partials) without ending the session.
+    /// Returns the text that is now considered typed (after line-break stripping).
+    @discardableResult
+    func applyLiveTranscript(previouslyEmitted: String, text: String) -> String {
+        let previous = prepared(previouslyEmitted)
+        let next = prepared(text)
+        switch mode {
+        case .stream:
+            _ = Self.reconcileStream(
+                previouslyEmitted: previous,
+                finalText: next,
+                insert: { [weak self] chunk in _ = self?.insert(chunk) },
+                deleteBackward: { [weak self] count in self?.deleteBackward(count) }
+            )
+            return next
+        case .buffer:
+            buffer = next
+            return next
+        }
+    }
+
+    /// Apply the authoritative final transcript after mic release.
+    /// Returns the effective final text for stream mode (or inserted buffer text).
+    @discardableResult
+    func commitFinal(previouslyEmitted: String, finalText: String) -> String {
+        let previous = prepared(previouslyEmitted)
+        let final = prepared(finalText)
+        switch mode {
+        case .stream:
+            return Self.reconcileStream(
+                previouslyEmitted: previous,
+                finalText: final,
+                insert: { [weak self] text in _ = self?.insert(text) },
+                deleteBackward: { [weak self] count in self?.deleteBackward(count) }
+            )
+        case .buffer:
+            buffer = final
+            return flush()
+        }
+    }
+
+    /// Shared pure reconciliation for stream mode (unit-testable).
+    nonisolated static func reconcileStream(
+        previouslyEmitted: String,
+        finalText: String,
+        insert: (String) -> Void,
+        deleteBackward: (Int) -> Void
+    ) -> String {
+        if finalText == previouslyEmitted {
+            return ""
+        }
+        if finalText.hasPrefix(previouslyEmitted) {
+            let rest = String(finalText.dropFirst(previouslyEmitted.count))
+            if !rest.isEmpty {
+                insert(rest)
+            }
+            return rest
+        }
+        if previouslyEmitted.isEmpty {
+            if !finalText.isEmpty {
+                insert(finalText)
+            }
+            return finalText
+        }
+
+        let shared = previouslyEmitted.commonPrefix(with: finalText)
+        let deleteCount = previouslyEmitted.count - shared.count
+        if deleteCount > 0 {
+            deleteBackward(deleteCount)
+        }
+        let tail = String(finalText.dropFirst(shared.count))
+        if !tail.isEmpty {
+            insert(tail)
+        }
+        return finalText
+    }
+
+    /// Post `count` backward-delete key events (stream draft correction).
+    func deleteBackward(_ count: Int) {
+        guard count > 0,
+              let source = CGEventSource(stateID: .combinedSessionState)
+        else {
+            return
+        }
+        let backspaceKey: CGKeyCode = 0x33
+        for _ in 0 ..< count {
+            guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: backspaceKey, keyDown: true),
+                  let keyUp = CGEvent(keyboardEventSource: source, virtualKey: backspaceKey, keyDown: false)
+            else {
+                continue
+            }
+            keyDown.flags = []
+            keyUp.flags = []
+            keyDown.post(tap: .cgAnnotatedSessionEventTap)
+            keyUp.post(tap: .cgAnnotatedSessionEventTap)
         }
     }
 
@@ -157,6 +263,7 @@ final class TextInserter {
         return settable.boolValue ? .valueSettable : .valueNotSettable
     }
 
+    /// Collapse newlines/tabs so synthetic key events cannot submit a shell line.
     static func sanitizeForTerminal(_ text: String) -> String {
         text
             .replacingOccurrences(of: "\r\n", with: " ")
@@ -168,8 +275,7 @@ final class TextInserter {
     // MARK: - CGEvent insertion
 
     /// Post Unicode text as keyboard events, chunked at 20 UTF-16 units, to
-    /// `.cgAnnotatedSessionEventTap` (localvoxtral's proven path). No inter-chunk
-    /// delay — localvoxtral does not use one.
+    /// `.cgAnnotatedSessionEventTap` (localvoxtral's proven path).
     @discardableResult
     func insert(_ text: String) -> Bool {
         guard !text.isEmpty,

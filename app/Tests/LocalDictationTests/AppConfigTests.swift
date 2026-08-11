@@ -124,13 +124,46 @@ struct AppConfigTests {
 
     @Test("Parakeet MLX provider resolves server flags")
     func parakeetMlxProviderResolvesServerFlags() throws {
-        let json = #"{"provider": "parakeet-mlx", "parakeetChunkSeconds": 0.75}"#
+        // Explicit HF id via `model` — no local path — so discovery cannot override.
+        let json = #"{"provider": "parakeet-mlx", "model": "mlx-community/parakeet-tdt-0.6b-v3", "parakeetChunkSeconds": 0.75}"#
         let config = try AppConfig.decode(Data(json.utf8))
         #expect(config.provider == .parakeetMlx)
         #expect(config.serverBackendFlag == "parakeet-mlx")
-        #expect(config.resolvedServerModel == SpeechProvider.parakeetMlxDefaultModel)
+        #expect(config.resolvedServerModel == "mlx-community/parakeet-tdt-0.6b-v3")
         #expect(config.parakeetChunkSeconds == 0.75)
         #expect(config.provider.usesPythonServer)
+    }
+
+    @Test("Parakeet MLX local path wins over HF model id")
+    func parakeetMlxLocalPathWinsOverModelId() throws {
+        let json = """
+        {"provider": "parakeet-mlx", "model": "mlx-community/ignored", "parakeetMlxModelPath": "~/parakeet-tdt-0.6b-v3"}
+        """
+        let config = try AppConfig.decode(Data(json.utf8))
+        #expect(config.parakeetMlxModelPath == "~/parakeet-tdt-0.6b-v3")
+        let resolved = config.resolvedServerModel ?? ""
+        #expect(resolved.hasSuffix("/parakeet-tdt-0.6b-v3") || resolved.contains("parakeet-tdt-0.6b-v3"))
+        #expect(!resolved.hasPrefix("mlx-community/"))
+    }
+
+    @Test("looksLikeParakeetMlxModelDirectory rejects CoreML trees")
+    func looksLikeParakeetMlxRejectsCoreML() throws {
+        try TestSupport.withTemporaryDirectory { root in
+            // Fake CoreML-looking tree
+            try FileManager.default.createDirectory(
+                at: root.appendingPathComponent("Encoder.mlmodelc"),
+                withIntermediateDirectories: true
+            )
+            try Data("{}".utf8).write(to: root.appendingPathComponent("config.json"))
+            #expect(!AppConfig.looksLikeParakeetMlxModelDirectory(root))
+
+            // Fake MLX tree
+            let mlx = root.appendingPathComponent("mlx", isDirectory: true)
+            try FileManager.default.createDirectory(at: mlx, withIntermediateDirectories: true)
+            try Data("{}".utf8).write(to: mlx.appendingPathComponent("config.json"))
+            try Data("x".utf8).write(to: mlx.appendingPathComponent("tokenizer.model"))
+            #expect(AppConfig.looksLikeParakeetMlxModelDirectory(mlx))
+        }
     }
 
     @Test("Provider is case-insensitive")

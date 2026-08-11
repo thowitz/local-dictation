@@ -202,9 +202,9 @@ final class DictationController {
 
         self.realtime.setCallbacks(
             RealtimeClient.Callbacks(
-                onDelta: { [weak self] delta in
+                onDelta: { [weak self] text, absolute in
                     Task { @MainActor in
-                        self?.handleDelta(delta)
+                        self?.handleDelta(text, absolute: absolute)
                     }
                 },
                 onDone: { [weak self] transcript in
@@ -720,28 +720,57 @@ final class DictationController {
         }
     }
 
-    private func handleDelta(_ delta: String) {
+    private func handleDelta(_ text: String, absolute: Bool = false) {
         guard cancellationBarrier.shouldAcceptTranscript(phase: transcriptSessionPhase) else { return }
-        sessionTranscript += delta
-        print("[transcript delta] \(delta)")
-        AppLog.general.info("delta: \(delta, privacy: .public)")
-        textInserter.handleDelta(delta)
+        guard !text.isEmpty || absolute else { return }
+
+        if absolute {
+            // Parakeet MLX draft snapshots revise freely — reconcile typed text.
+            // Terminal sessions strip newlines first so tracking matches keystrokes.
+            let previous = sessionTranscript
+            print("[transcript absolute] \(text)")
+            AppLog.general.info(
+                "absolute partial chars=\(text.count, privacy: .public) prev=\(previous.count, privacy: .public)"
+            )
+            sessionTranscript = textInserter.applyLiveTranscript(
+                previouslyEmitted: previous,
+                text: text
+            )
+            return
+        }
+
+        let prepared = textInserter.prepared(text)
+        guard !prepared.isEmpty else { return }
+        sessionTranscript += prepared
+        print("[transcript delta] \(prepared)")
+        AppLog.general.info("delta: \(prepared, privacy: .public)")
+        textInserter.handleDelta(text)
     }
 
     private func handleDone(_ transcript: String) {
         guard cancellationBarrier.shouldAcceptTranscript(phase: transcriptSessionPhase) else { return }
+        // Prefer server final text; fall back to what we already streamed.
         let finalText = transcript.isEmpty ? sessionTranscript : transcript
+        let previouslyEmitted = sessionTranscript
         print("[transcript done] \(finalText)")
-        AppLog.general.info("done: \(finalText, privacy: .public)")
-        sessionTranscript = ""
+        AppLog.general.info(
+            "done: \(finalText, privacy: .public) previously=\(previouslyEmitted.count, privacy: .public) chars"
+        )
 
         if state == .flushing {
-            let inserted = textInserter.flush()
+            // Stream mode previously ignored done.text (only live deltas typed),
+            // so sticky draft hallucinations (\"yeah\") were never corrected.
+            // Buffer mode replaces the accumulated buffer with the final text.
+            let inserted = textInserter.commitFinal(
+                previouslyEmitted: previouslyEmitted,
+                finalText: finalText
+            )
             if !inserted.isEmpty {
                 AppLog.general.info(
-                    "buffer flush inserted \(inserted.count, privacy: .public) chars"
+                    "final commit inserted/reconciled \(inserted.count, privacy: .public) chars stripLineBreaks=\(self.textInserter.stripLineBreaks, privacy: .public)"
                 )
             }
+            sessionTranscript = ""
             intent.clearAll()
             escapeHotKey.unregister()
             endIndicatorSession(playSound: true)
@@ -751,6 +780,8 @@ final class DictationController {
             } else {
                 transition(to: .starting)
             }
+        } else {
+            sessionTranscript = ""
         }
     }
 
@@ -820,6 +851,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var parakeetProviderItem: NSMenuItem!
     private var parakeetMlxProviderItem: NSMenuItem!
     private var parakeetModelPathItem: NSMenuItem!
+    private var parakeetMlxModelPathItem: NSMenuItem!
+    private var clearParakeetMlxPathItem: NSMenuItem!
     private var clearParakeetPathItem: NSMenuItem!
     private var micPermissionItem: NSMenuItem!
     private var axPermissionItem: NSMenuItem!
@@ -1037,12 +1070,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         speechProviderMenu.addItem(parakeetModelPathItem)
 
         clearParakeetPathItem = NSMenuItem(
-            title: "Clear Parakeet Model Path",
+            title: "Clear Parakeet CoreML Model Path",
             action: #selector(clearParakeetModelPath),
             keyEquivalent: ""
         )
         clearParakeetPathItem.target = self
         speechProviderMenu.addItem(clearParakeetPathItem)
+
+        parakeetMlxModelPathItem = NSMenuItem(
+            title: "Choose Parakeet MLX Model Folder…",
+            action: #selector(chooseParakeetMlxModelPath),
+            keyEquivalent: ""
+        )
+        parakeetMlxModelPathItem.target = self
+        speechProviderMenu.addItem(parakeetMlxModelPathItem)
+
+        clearParakeetMlxPathItem = NSMenuItem(
+            title: "Clear Parakeet MLX Model Path",
+            action: #selector(clearParakeetMlxModelPath),
+            keyEquivalent: ""
+        )
+        clearParakeetMlxPathItem.target = self
+        speechProviderMenu.addItem(clearParakeetMlxPathItem)
 
         speechProviderItem = NSMenuItem(title: "Speech Provider", action: nil, keyEquivalent: "")
         speechProviderItem.submenu = speechProviderMenu
@@ -1177,7 +1226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.canCreateDirectories = false
         panel.prompt = "Select"
         panel.message =
-            "Select a Parakeet CoreML model folder containing Preprocessor/Encoder/Decoder/JointDecisionv3 and parakeet_vocab.json."
+            "Select a Parakeet TDT v3 CoreML model folder (Preprocessor/Encoder/Decoder/JointDecisionv3 + parakeet_vocab.json)."
         if let current = config.parakeetModelPath, !current.isEmpty {
             let expanded = (current as NSString).expandingTildeInPath
             panel.directoryURL = URL(fileURLWithPath: expanded, isDirectory: true)
@@ -1189,9 +1238,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
-        guard ParakeetEngine.containsV3Bundles(at: url) else {
+        guard ParakeetEngine.containsV3Bundles(at: url)
+            || ParakeetEngine.makeLoadableDirectory(from: url) != nil
+        else {
             let alert = NSAlert()
-            alert.messageText = "Not a Parakeet v3 model folder"
+            alert.messageText = "Not a Parakeet TDT v3 model folder"
             alert.informativeText = """
             Expected these items inside the folder:
             • Preprocessor.mlmodelc
@@ -1224,6 +1275,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         config.parakeetModelPath = nil
         config.save()
         if config.provider == .parakeet {
+            rebootstrapSpeechRuntime()
+        }
+        refreshSpeechProviderItems()
+    }
+
+    @objc private func chooseParakeetMlxModelPath() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "Select"
+        panel.message =
+            "Select a Parakeet TDT MLX model folder (config.json + tokenizer; e.g. ~/parakeet-tdt-0.6b-v3 from mlx-community)."
+        if let current = config.parakeetMlxModelPath, !current.isEmpty {
+            let expanded = (current as NSString).expandingTildeInPath
+            panel.directoryURL = URL(fileURLWithPath: expanded, isDirectory: true)
+        } else if let discovered = AppConfig.discoverParakeetMlxModelDirectory() {
+            panel.directoryURL = discovered
+        } else {
+            panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        guard AppConfig.looksLikeParakeetMlxModelDirectory(url) else {
+            let alert = NSAlert()
+            alert.messageText = "Not a Parakeet MLX model folder"
+            alert.informativeText = """
+            Expected a Hugging Face mlx-community style clone with:
+            • config.json
+            • tokenizer.model (or tokenizer.vocab / vocab.txt / tokenizer.json)
+
+            Do not select the CoreML folder (*-coreml with Encoder.mlmodelc).
+
+            Selected: \(url.path)
+            """
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return
+        }
+
+        config.parakeetMlxModelPath = url.path
+        // Choosing an MLX folder implies using the MLX provider.
+        config.provider = .parakeetMlx
+        config.save()
+        rebootstrapSpeechRuntime()
+        refreshSpeechProviderItems()
+        AppLog.general.info(
+            "Parakeet MLX model path set to \(url.path, privacy: .public); speech runtime restarted"
+        )
+    }
+
+    @objc private func clearParakeetMlxModelPath() {
+        guard config.parakeetMlxModelPath != nil else { return }
+        config.parakeetMlxModelPath = nil
+        config.save()
+        if config.provider == .parakeetMlx {
             rebootstrapSpeechRuntime()
         }
         refreshSpeechProviderItems()
@@ -1619,7 +1730,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         parakeetMlxProviderItem.state = provider == .parakeetMlx ? .on : .off
         speechProviderItem.title = "Speech Provider: \(provider.displayName)"
 
-        // CoreML folder picker only applies to the in-process CoreML path.
+        // CoreML + MLX folder pickers (always available; selecting implies that provider).
         parakeetModelPathItem.isEnabled = true
         if let path = config.parakeetModelPath, !path.isEmpty {
             let display = (path as NSString).abbreviatingWithTildeInPath
@@ -1632,6 +1743,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             parakeetModelPathItem.title = "Choose Parakeet CoreML Model Folder…"
             clearParakeetPathItem.isEnabled = false
+        }
+
+        parakeetMlxModelPathItem.isEnabled = true
+        if let path = config.parakeetMlxModelPath, !path.isEmpty {
+            let display = (path as NSString).abbreviatingWithTildeInPath
+            parakeetMlxModelPathItem.title = "MLX Model: \(display)"
+            clearParakeetMlxPathItem.isEnabled = true
+        } else if let discovered = AppConfig.discoverParakeetMlxModelDirectory() {
+            let display = (discovered.path as NSString).abbreviatingWithTildeInPath
+            parakeetMlxModelPathItem.title = "MLX Model: \(display) (auto)"
+            clearParakeetMlxPathItem.isEnabled = false
+        } else if let model = config.model, !model.isEmpty, config.provider == .parakeetMlx {
+            parakeetMlxModelPathItem.title = "MLX Model: \(model) (HF id)"
+            clearParakeetMlxPathItem.isEnabled = false
+        } else {
+            parakeetMlxModelPathItem.title = "Choose Parakeet MLX Model Folder…"
+            clearParakeetMlxPathItem.isEnabled = false
         }
     }
 

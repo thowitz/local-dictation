@@ -3,11 +3,11 @@ import Foundation
 import Testing
 @testable import LocalDictation
 
-/// End-to-end Parakeet smoke: synthesize speech with macOS `say`, then transcribe
-/// with the staged CoreML model. Skips cleanly when models or `say` are unavailable.
-@Suite("ParakeetAudioSmoke")
+/// End-to-end Parakeet TDT sliding-window smoke: synthesize speech with macOS `say`, then stream
+/// through the staged CoreML EOU model. Skips when models or `say` are unavailable.
+@Suite("ParakeetAudioSmoke", .serialized)
 struct ParakeetAudioSmokeTests {
-    @Test("Parakeet transcribes synthesized speech audio")
+    @Test("Parakeet TDT streams and finalizes synthesized speech")
     func parakeetTranscribesSynthesizedSpeech() async throws {
         guard let modelDir = ParakeetEngine.resolveModelDirectory(explicitPath: nil) else {
             // No staged models in this environment.
@@ -28,7 +28,17 @@ struct ParakeetAudioSmokeTests {
         try await engine.load(directory: modelDir)
         #expect(await engine.isReady())
 
-        let text = try await engine.transcribe(pcm16: pcm16)
+        try await engine.beginUtterance()
+        // Stream in ~100 ms slices so sliding windows fire mid-utterance.
+        let slice = 16_000 * 2 / 10
+        var offset = 0
+        while offset < pcm16.count {
+            let end = min(offset + slice, pcm16.count)
+            try await engine.processAudio(pcm16: pcm16.subdata(in: offset..<end))
+            offset = end
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let text = try await engine.finishUtterance()
         await engine.unload()
 
         let normalized = text.lowercased()

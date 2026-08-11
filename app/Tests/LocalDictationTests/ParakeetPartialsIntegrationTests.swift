@@ -3,9 +3,9 @@ import Foundation
 import Testing
 @testable import LocalDictation
 
-/// Verifies CoreML Parakeet emits growing partials while audio is streamed,
-/// then finalizes cleanly on commit. Skips when models / `say` are missing.
-@Suite("ParakeetPartialsIntegration")
+/// Verifies Parakeet EOU true streaming emits growing partials while audio is
+/// streamed, then finalizes cleanly on commit. Skips when models / `say` are missing.
+@Suite("ParakeetPartialsIntegration", .serialized)
 struct ParakeetPartialsIntegrationTests {
     @Test("Partials emit before commit on multi-second speech")
     func partialsEmitBeforeCommit() async throws {
@@ -16,13 +16,13 @@ struct ParakeetPartialsIntegrationTests {
             return
         }
 
-        // Longer phrase so multiple ~0.75 s partial windows fire.
+        // Longer phrase so multiple streaming chunks fire.
         let phrase =
             "The quick brown fox jumps over the lazy dog near the river bank today"
         let wavURL = try synthesizeWAV(text: phrase)
         defer { try? FileManager.default.removeItem(at: wavURL) }
         let pcm16 = try pcm16Data(from: wavURL)
-        // Need enough audio for at least two partial thresholds.
+        // Need enough audio for multiple 320 ms streaming windows.
         let halfSecondBytes = 16_000 * 2 / 2
         #expect(pcm16.count > halfSecondBytes * 3, "Audio too short for partial windows")
 
@@ -30,11 +30,11 @@ struct ParakeetPartialsIntegrationTests {
         try await engine.load(directory: modelDir)
         #expect(await engine.isReady())
 
-        let client = ParakeetRealtimeClient(engine: engine, chunkSeconds: 0.75)
+        let client = ParakeetRealtimeClient(engine: engine, chunkSeconds: 0.4)
         let collector = DeltaCollector()
         client.setCallbacks(
             RealtimeClient.Callbacks(
-                onDelta: { delta in collector.appendDelta(delta) },
+                onDelta: { delta, _ in collector.appendDelta(delta) },
                 onDone: { text in collector.markDone(text) },
                 onError: { message in collector.markError(message) }
             )
@@ -55,11 +55,11 @@ struct ParakeetPartialsIntegrationTests {
             let end = min(offset + sliceBytes, pcm16.count)
             client.sendAudio(pcm16.subdata(in: offset..<end))
             offset = end
-            try await Task.sleep(for: .milliseconds(20))
+            try await Task.sleep(for: .milliseconds(30))
         }
 
-        // Allow in-flight partials to finish before commit.
-        try await Task.sleep(for: .seconds(3))
+        // Allow in-flight streaming decode to catch up before commit.
+        try await Task.sleep(for: .seconds(2))
         let partialCountBeforeCommit = collector.deltaCount
         let partialJoined = collector.joinedDeltas
 
@@ -70,7 +70,7 @@ struct ParakeetPartialsIntegrationTests {
 
         #expect(client.commitFinal())
         // Wait for done.
-        for _ in 0..<200 {
+        for _ in 0..<300 {
             if collector.isDone || collector.errorMessage != nil { break }
             try await Task.sleep(for: .milliseconds(50))
         }
@@ -87,7 +87,7 @@ struct ParakeetPartialsIntegrationTests {
             .filter { haystack.contains($0) }
         #expect(
             hits.count >= 2,
-            "Final text \(haystack.debugDescription) matched too few expected words from phrase"
+            "Final text \(haystack.debugDescription) matched too few expected words from phrase (hits=\(hits))"
         )
 
         // Partials must be a prefix path into the final transcript (or equal).
@@ -115,11 +115,11 @@ struct ParakeetPartialsIntegrationTests {
 
         let engine = ParakeetEngine()
         try await engine.load(directory: modelDir)
-        let client = ParakeetRealtimeClient(engine: engine, chunkSeconds: 0) // finalize-only
+        let client = ParakeetRealtimeClient(engine: engine, chunkSeconds: 0.5)
         let collector = DeltaCollector()
         client.setCallbacks(
             RealtimeClient.Callbacks(
-                onDelta: { delta in collector.appendDelta(delta) },
+                onDelta: { delta, _ in collector.appendDelta(delta) },
                 onDone: { text in collector.markDone(text) },
                 onError: { message in collector.markError(message) }
             )
@@ -131,26 +131,39 @@ struct ParakeetPartialsIntegrationTests {
         }
         #expect(client.isConnected)
 
-        // Utterance 1
-        let pcm1 = try pcm16Data(from: try synthesizeWAV(text: "alpha bravo charlie"))
-        client.sendAudio(pcm1)
+        // Utterance 1 — stream in slices so the encoder sees paced audio (like the mic).
+        let pcm1 = try pcm16Data(from: try synthesizeWAV(text: "alpha bravo charlie one two three"))
+        let slice = 16_000 * 2 / 10
+        var offset = 0
+        while offset < pcm1.count {
+            let end = min(offset + slice, pcm1.count)
+            client.sendAudio(pcm1.subdata(in: offset..<end))
+            offset = end
+            try await Task.sleep(for: .milliseconds(25))
+        }
         #expect(client.commitFinal())
-        for _ in 0..<200 {
+        for _ in 0..<300 {
             if collector.isDone || collector.errorMessage != nil { break }
             try await Task.sleep(for: .milliseconds(50))
         }
         #expect(collector.errorMessage == nil, "first utterance error: \(collector.errorMessage ?? "")")
         #expect(collector.isDone)
         let first = (collector.doneText ?? collector.joinedDeltas).lowercased()
-        #expect(!first.isEmpty, "first utterance empty")
+        #expect(!first.isEmpty, "first utterance empty — got \(first.debugDescription)")
 
         // Reset collector for utterance 2 (simulates next hold session)
         collector.resetForNextUtterance()
 
-        let pcm2 = try pcm16Data(from: try synthesizeWAV(text: "delta echo foxtrot"))
-        client.sendAudio(pcm2)
+        let pcm2 = try pcm16Data(from: try synthesizeWAV(text: "delta echo foxtrot four five six"))
+        offset = 0
+        while offset < pcm2.count {
+            let end = min(offset + slice, pcm2.count)
+            client.sendAudio(pcm2.subdata(in: offset..<end))
+            offset = end
+            try await Task.sleep(for: .milliseconds(25))
+        }
         #expect(client.commitFinal())
-        for _ in 0..<200 {
+        for _ in 0..<300 {
             if collector.isDone || collector.errorMessage != nil { break }
             try await Task.sleep(for: .milliseconds(50))
         }
@@ -159,12 +172,10 @@ struct ParakeetPartialsIntegrationTests {
         let second = (collector.doneText ?? collector.joinedDeltas).lowercased()
         #expect(
             !second.isEmpty,
-            "second utterance produced no text — multi-session emittedText leak"
+            "second utterance produced no text — multi-session emittedText leak; got \(second.debugDescription)"
         )
-        // Prefer some content signal from the second phrase.
-        let hits = ["delta", "echo", "foxtrot", "delta", "echo"].filter { second.contains($0) }
-        // Soft: non-empty is the hard requirement; hits are best-effort ASR.
-        _ = hits
+        // Soft content check on second phrase.
+        _ = ["delta", "echo", "foxtrot"].filter { second.contains($0) }
 
         client.disconnect()
         await engine.unload()

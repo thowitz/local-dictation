@@ -1,10 +1,17 @@
+@preconcurrency import AVFoundation
 @preconcurrency import CoreML
 import FluidAudio
 import Foundation
 import os
 
-/// Shared in-process Parakeet TDT engine used by the runtime (load/unload) and
-/// the realtime client (buffer + batch transcribe on finalize).
+/// In-process Parakeet **TDT 0.6B v3** engine.
+///
+/// Live partials use FluidAudio `SlidingWindowAsrManager` with a **short dictation
+/// window** (not the long-form ~11 s default). Release runs a full-buffer
+/// `AsrManager.transcribe` with trailing silence so the last words are not clipped.
+///
+/// Window math: first partial after roughly `chunk + right` seconds of audio.
+/// `parakeetChunkSeconds` maps to the center stride (clamped for quality).
 actor ParakeetEngine {
     enum EngineError: Error, LocalizedError, Sendable {
         case notReady
@@ -15,7 +22,7 @@ actor ParakeetEngine {
         var errorDescription: String? {
             switch self {
             case .notReady:
-                return "Parakeet model is not loaded."
+                return "Parakeet TDT model is not loaded."
             case .modelNotFound(let url):
                 return "Parakeet model not found at \(url.path)."
             case .loadFailed(let message):
@@ -26,11 +33,7 @@ actor ParakeetEngine {
         }
     }
 
-    /// FluidAudio's on-disk cache folder for v3 (strips the HF `-coreml` suffix).
-    /// `AsrModels.load(from:)` resolves models via `parent/folderName/…`.
     static let fluidAudioFolderName = "parakeet-tdt-0.6b-v3"
-
-    /// Common staged directory names users may already have (HF clone name).
     static let huggingfaceRepoFolderName = "parakeet-tdt-0.6b-v3-coreml"
 
     private static let requiredBundleNames = [
@@ -41,44 +44,78 @@ actor ParakeetEngine {
         "parakeet_vocab.json",
     ]
 
-    private var asrManager: AsrManager?
+    /// Shared CoreML bundles (expensive).
+    private var models: AsrModels?
     private var loadedFrom: URL?
+    /// Dedicated finalizer for full-buffer commit (silence-padded).
+    private var finalizer: AsrManager?
+
+    private var stream: SlidingWindowAsrManager?
+    private var updateTask: Task<Void, Never>?
+    private var partialHandler: (@Sendable (String) -> Void)?
+    /// PCM16 for the active hold — used for high-quality final re-transcribe.
+    private var utterancePCM = Data()
+    /// Longest non-empty partial seen this hold (sliding window can briefly blank).
+    private var bestPartial = ""
+
+    private var windowConfig: SlidingWindowAsrConfig =
+        ParakeetEngine.dictationWindowConfig(chunkSeconds: 1.5)
+
+    /// Dictation-tuned window. TDT degrades badly below ~1 s centers; FluidAudio
+    /// long-form uses ~11 s. We sit in the middle for live partials + quality.
+    nonisolated static func dictationWindowConfig(chunkSeconds: Double) -> SlidingWindowAsrConfig {
+        // Floor 1.0s: shorter centers produce empty follow-up windows on TDT v3.
+        let chunk = min(4.0, max(1.0, chunkSeconds > 0 ? chunkSeconds : 1.5))
+        let right = min(0.75, max(0.35, chunk * 0.3))
+        let left = min(3.0, max(1.5, chunk))
+        // Confirm earlier than long-form's 10 s so inserts stick during a hold.
+        let minConfirm = min(4.0, max(1.5, chunk + right))
+        return SlidingWindowAsrConfig(
+            chunkSeconds: chunk,
+            hypothesisChunkSeconds: min(1.0, chunk * 0.5),
+            leftContextSeconds: left,
+            rightContextSeconds: right,
+            minContextForConfirmation: minConfirm,
+            confirmationThreshold: 0.70
+        )
+    }
 
     func isReady() async -> Bool {
-        guard let asrManager else { return false }
-        return await asrManager.isAvailable
+        models != nil && finalizer != nil
     }
 
     func modelSourceDescription() -> String {
-        if let loadedFrom {
-            return loadedFrom.path
-        }
-        return "(not loaded)"
+        if let loadedFrom { return loadedFrom.path }
+        return models == nil ? "(not loaded)" : "(FluidAudio cache)"
     }
 
-    /// True when `directory` itself contains the v3 CoreML bundles + vocab.
+    func setPartialHandler(_ handler: (@Sendable (String) -> Void)?) {
+        partialHandler = handler
+    }
+
+    func setChunkSeconds(_ seconds: Double) {
+        windowConfig = Self.dictationWindowConfig(chunkSeconds: seconds)
+        AppLog.general.info(
+            "Parakeet TDT window chunk=\(self.windowConfig.chunkSeconds, privacy: .public)s left=\(self.windowConfig.leftContextSeconds, privacy: .public)s right=\(self.windowConfig.rightContextSeconds, privacy: .public)s (first partial ~\(self.windowConfig.chunkSeconds + self.windowConfig.rightContextSeconds, privacy: .public)s)"
+        )
+    }
+
+    // MARK: - Discovery
+
     nonisolated static func containsV3Bundles(at directory: URL) -> Bool {
         let fm = FileManager.default
-        return requiredBundleNames.allSatisfy { name in
-            fm.fileExists(atPath: directory.appendingPathComponent(name).path)
+        return requiredBundleNames.allSatisfy {
+            fm.fileExists(atPath: directory.appendingPathComponent($0).path)
         }
     }
 
-    /// Resolve a staged model directory for `AsrModels.load(from:)`.
-    ///
-    /// FluidAudio expects the last path component to be its cache folder name
-    /// (`parakeet-tdt-0.6b-v3`). Hugging Face clones commonly use
-    /// `parakeet-tdt-0.6b-v3-coreml`. When the user points at a HF-layout folder,
-    /// we create a stable symlink under Application Support so load works offline.
     nonisolated static func resolveModelDirectory(explicitPath: String?) -> URL? {
         let fm = FileManager.default
         var candidates: [URL] = []
-
         if let explicitPath, !explicitPath.isEmpty {
             let expanded = (explicitPath as NSString).expandingTildeInPath
             candidates.append(URL(fileURLWithPath: expanded, isDirectory: true))
         }
-
         let home = fm.homeDirectoryForCurrentUser
         candidates.append(contentsOf: [
             home.appendingPathComponent(huggingfaceRepoFolderName, isDirectory: true),
@@ -93,7 +130,6 @@ actor ParakeetEngine {
                 .appendingPathComponent("parakeet-models", isDirectory: true)
                 .appendingPathComponent(fluidAudioFolderName, isDirectory: true),
         ])
-
         for candidate in candidates {
             if let loadable = makeLoadableDirectory(from: candidate) {
                 return loadable
@@ -102,32 +138,24 @@ actor ParakeetEngine {
         return nil
     }
 
-    /// Returns a directory suitable for `AsrModels.load(from:)` or nil.
     nonisolated static func makeLoadableDirectory(from directory: URL) -> URL? {
         let fm = FileManager.default
         guard fm.fileExists(atPath: directory.path) else { return nil }
-
-        // Already in FluidAudio's expected layout (parent/folderName).
         if directory.lastPathComponent == fluidAudioFolderName, containsV3Bundles(at: directory) {
             return directory
         }
         if AsrModels.modelsExist(at: directory, version: .v3) {
             return directory
         }
-
-        // HF clone / arbitrary folder that directly holds the bundles.
         guard containsV3Bundles(at: directory) else { return nil }
 
-        // Stage a stable symlink: Application Support/LocalDictation/parakeet-models/parakeet-tdt-0.6b-v3 → directory
         let stagingParent = AppConfig.supportDirectoryURL
             .appendingPathComponent("parakeet-models", isDirectory: true)
         let linkURL = stagingParent.appendingPathComponent(fluidAudioFolderName, isDirectory: true)
-
         do {
             try fm.createDirectory(at: stagingParent, withIntermediateDirectories: true)
             var isDir: ObjCBool = false
             if fm.fileExists(atPath: linkURL.path, isDirectory: &isDir) {
-                // Re-point if it's a symlink or wrong target.
                 let attrs = try? fm.attributesOfItem(atPath: linkURL.path)
                 let isSymlink = (attrs?[.type] as? FileAttributeType) == .typeSymbolicLink
                 if isSymlink {
@@ -143,9 +171,6 @@ actor ParakeetEngine {
                 }
             }
             try fm.createSymbolicLink(at: linkURL, withDestinationURL: directory)
-            AppLog.general.info(
-                "Parakeet staged model symlink \(linkURL.path, privacy: .public) → \(directory.path, privacy: .public)"
-            )
             return linkURL
         } catch {
             AppLog.general.error(
@@ -155,38 +180,42 @@ actor ParakeetEngine {
         }
     }
 
-    /// Load models. When `directory` is set, loads offline from that folder.
-    /// Otherwise uses FluidAudio download-and-load (Hugging Face cache).
-    func load(directory: URL?) async throws {
-        if await isReady() { return }
+    // MARK: - Load / unload
 
+    func load(directory: URL?) async throws {
+        if models != nil, finalizer != nil { return }
         do {
-            let models: AsrModels
+            let loaded: AsrModels
             if let directory {
                 guard let loadable = Self.makeLoadableDirectory(from: directory)
                     ?? (Self.containsV3Bundles(at: directory) ? directory : nil)
-                else {
-                    throw EngineError.modelNotFound(directory)
-                }
+                else { throw EngineError.modelNotFound(directory) }
                 AppLog.general.info(
-                    "Parakeet loading CoreML models from \(loadable.path, privacy: .public)"
+                    "Parakeet TDT loading from \(loadable.path, privacy: .public)"
                 )
-                // Prefer offline when a staged directory is provided.
                 ModelHub.offlineMode = true
-                models = try await AsrModels.load(from: loadable, version: .v3)
+                loaded = try await AsrModels.load(from: loadable, version: .v3)
                 loadedFrom = loadable
+            } else if let discovered = Self.resolveModelDirectory(explicitPath: nil) {
+                AppLog.general.info(
+                    "Parakeet TDT loading from \(discovered.path, privacy: .public)"
+                )
+                ModelHub.offlineMode = true
+                loaded = try await AsrModels.load(from: discovered, version: .v3)
+                loadedFrom = discovered
             } else {
-                AppLog.general.info("Parakeet downloading/loading CoreML models via FluidAudio")
+                AppLog.general.info("Parakeet TDT downloading via FluidAudio")
                 ModelHub.offlineMode = false
-                models = try await AsrModels.downloadAndLoad(version: .v3)
+                loaded = try await AsrModels.downloadAndLoad(version: .v3)
                 loadedFrom = AsrModels.defaultCacheDirectory(for: .v3)
             }
-
-            let manager = AsrManager(config: .default)
-            try await manager.loadModels(models)
-            asrManager = manager
-            let source = modelSourceDescription()
-            AppLog.general.info("Parakeet models ready (source=\(source, privacy: .public))")
+            models = loaded
+            let mgr = AsrManager(config: .default)
+            try await mgr.loadModels(loaded)
+            finalizer = mgr
+            AppLog.general.info(
+                "Parakeet TDT ready source=\(self.modelSourceDescription(), privacy: .public) chunk=\(self.windowConfig.chunkSeconds, privacy: .public)s"
+            )
         } catch let error as EngineError {
             throw error
         } catch {
@@ -195,38 +224,201 @@ actor ParakeetEngine {
     }
 
     func unload() async {
-        if let asrManager {
-            await asrManager.cleanup()
+        await endStream(cancelOnly: true)
+        if let finalizer {
+            await finalizer.cleanup()
         }
-        asrManager = nil
+        finalizer = nil
+        models = nil
         loadedFrom = nil
-        AppLog.general.info("Parakeet models unloaded")
+        AppLog.general.info("Parakeet TDT unloaded")
     }
 
-    /// Transcribe 16 kHz mono PCM16 little-endian audio.
-    func transcribe(pcm16: Data) async throws -> String {
-        guard let asrManager, await asrManager.isAvailable else {
-            throw EngineError.notReady
-        }
+    // MARK: - Utterance
 
-        let samples = Self.pcm16ToFloat32(pcm16)
-        let minimum = ASRConstants.minimumRequiredSamples(forSampleRate: ASRConstants.sampleRate)
-        guard samples.count >= minimum else {
-            // Too short to recognize — treat as empty utterance rather than failing the session.
-            return ""
-        }
+    func beginUtterance() async throws {
+        guard let models else { throw EngineError.notReady }
+        await endStream(cancelOnly: true)
+        utterancePCM.removeAll(keepingCapacity: true)
+        bestPartial = ""
 
+        let manager = SlidingWindowAsrManager(config: windowConfig)
+        try await manager.loadModels(models)
+        let updates = await manager.transcriptionUpdates
+        updateTask = Task { [weak self] in
+            for await update in updates {
+                guard let self else { return }
+                await self.handleStreamUpdate(update)
+            }
+        }
+        try await manager.startStreaming(source: .microphone)
+        stream = manager
+        AppLog.realtime.info(
+            "Parakeet TDT stream start chunk=\(self.windowConfig.chunkSeconds, privacy: .public)s"
+        )
+    }
+
+    func processAudio(pcm16: Data) async throws {
+        guard !pcm16.isEmpty else { return }
+        if stream == nil {
+            try await beginUtterance()
+        }
+        utterancePCM.append(pcm16)
+        guard let stream, let buffer = Self.makeFloatPCMBuffer(fromPCM16: pcm16) else {
+            throw EngineError.transcriptionFailed("Failed to build audio buffer")
+        }
+        await stream.streamAudio(buffer)
+    }
+
+    func finishUtterance() async throws -> String {
+        // Stop sliding-window stream (may leave a partial transcript).
+        let streamText: String
+        if let stream {
+            do {
+                streamText = try await stream.finish()
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } catch {
+                streamText = bestPartial
+                AppLog.realtime.error(
+                    "Parakeet TDT stream finish error: \(error.localizedDescription, privacy: .public)"
+                )
+            }
+        } else {
+            streamText = bestPartial
+        }
+        await endStream(cancelOnly: false)
+
+        // Full-buffer finalize with trailing silence — TDT needs this for last words
+        // and recovers content that short windows missed.
+        let pcm = utterancePCM
+        utterancePCM.removeAll(keepingCapacity: true)
+        bestPartial = ""
+
+        guard !pcm.isEmpty else { return streamText }
         do {
-            // Fresh decoder state per call; also clear FluidAudio scratch caches so
-            // successive utterances do not share residual encoder/decoder state.
-            await asrManager.reset()
-            let layers = await asrManager.decoderLayerCount
+            let finalText = try await transcribeFullBuffer(pcm16: pcm)
+            if finalText.isEmpty {
+                return streamText
+            }
+            // Prefer the longer / more complete result.
+            if finalText.count >= streamText.count || streamText.isEmpty {
+                return finalText
+            }
+            return streamText
+        } catch {
+            if !streamText.isEmpty { return streamText }
+            throw error
+        }
+    }
+
+    func cancelUtterance() async {
+        await endStream(cancelOnly: true)
+        utterancePCM.removeAll(keepingCapacity: false)
+        bestPartial = ""
+    }
+
+    func currentPartial() async -> String { bestPartial }
+
+    // MARK: - Internals
+
+    private func handleStreamUpdate(_ update: SlidingWindowTranscriptionUpdate) async {
+        guard let stream else { return }
+        let composed = Self.composeTranscript(
+            confirmed: await stream.confirmedTranscript,
+            volatile: await stream.volatileTranscript
+        )
+        // Sliding-window can emit empty follow-up windows that wipe volatile.
+        // Keep the best non-empty growing text for partials.
+        let candidate: String
+        if composed.isEmpty {
+            candidate = bestPartial
+        } else if bestPartial.isEmpty
+            || composed.hasPrefix(bestPartial)
+            || composed.count >= bestPartial.count
+        {
+            candidate = composed
+        } else {
+            candidate = bestPartial
+        }
+        guard !candidate.isEmpty, candidate != bestPartial || update.isConfirmed else {
+            if !candidate.isEmpty { bestPartial = candidate }
+            return
+        }
+        bestPartial = candidate
+        partialHandler?(candidate)
+        AppLog.realtime.info(
+            "Parakeet TDT partial conf=\(update.confidence, privacy: .public) confirmed=\(update.isConfirmed, privacy: .public) chars=\(candidate.count, privacy: .public)"
+        )
+    }
+
+    private func endStream(cancelOnly: Bool) async {
+        updateTask?.cancel()
+        updateTask = nil
+        if let stream, cancelOnly {
+            await stream.cancel()
+        }
+        stream = nil
+    }
+
+    /// Batch-transcribe the full hold with ~500 ms trailing silence.
+    private func transcribeFullBuffer(pcm16: Data) async throws -> String {
+        guard let finalizer else { throw EngineError.notReady }
+        let padded = Self.appendSilence(to: pcm16, seconds: 0.5)
+        let samples = Self.pcm16ToFloat32(padded)
+        let minimum = ASRConstants.minimumRequiredSamples(forSampleRate: ASRConstants.sampleRate)
+        guard samples.count >= minimum else { return "" }
+        do {
+            await finalizer.reset()
+            let layers = await finalizer.decoderLayerCount
             var decoderState = TdtDecoderState.make(decoderLayers: layers)
-            let result = try await asrManager.transcribe(samples, decoderState: &decoderState)
+            let result = try await finalizer.transcribe(samples, decoderState: &decoderState)
             return result.text.trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
             throw EngineError.transcriptionFailed(error.localizedDescription)
         }
+    }
+
+    nonisolated static func composeTranscript(confirmed: String, volatile: String) -> String {
+        let c = confirmed.trimmingCharacters(in: .whitespacesAndNewlines)
+        let v = volatile.trimmingCharacters(in: .whitespacesAndNewlines)
+        if c.isEmpty { return v }
+        if v.isEmpty { return c }
+        if v.hasPrefix(c) { return v }
+        return c + " " + v
+    }
+
+    nonisolated static func appendSilence(to pcm16: Data, seconds: Double) -> Data {
+        guard seconds > 0, !pcm16.isEmpty else { return pcm16 }
+        let n = Int(seconds * 16_000)
+        guard n > 0 else { return pcm16 }
+        var out = pcm16
+        out.append(Data(count: n * MemoryLayout<Int16>.size))
+        return out
+    }
+
+    nonisolated static func makeFloatPCMBuffer(fromPCM16 data: Data) -> AVAudioPCMBuffer? {
+        let sampleCount = data.count / MemoryLayout<Int16>.size
+        guard sampleCount > 0 else { return nil }
+        guard let format = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        ) else { return nil }
+        guard let buffer = AVAudioPCMBuffer(
+            pcmFormat: format,
+            frameCapacity: AVAudioFrameCount(sampleCount)
+        ) else { return nil }
+        buffer.frameLength = AVAudioFrameCount(sampleCount)
+        guard let channel = buffer.floatChannelData?[0] else { return nil }
+        data.withUnsafeBytes { raw in
+            let src = raw.bindMemory(to: Int16.self)
+            let scale = Float(Int16.max)
+            for i in 0..<sampleCount {
+                channel[i] = Float(src[i]) / scale
+            }
+        }
+        return buffer
     }
 
     nonisolated static func pcm16ToFloat32(_ data: Data) -> [Float] {

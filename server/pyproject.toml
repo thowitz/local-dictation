@@ -22,10 +22,12 @@ packages = ["src/local_dictation_server"]
 
 [tool.uv]
 package = true
-# librosa/numba resolution can pick ancient numba pins; force modern wheels.
+# librosa/numba resolution can pick ancient pins. numba 0.66+ needs llvmlite
+# >=0.49; on Python 3.13 only 0.49.0rc1 wheels exist (stable 0.49 not on PyPI yet).
+# Mismatch (e.g. numba 0.67 + llvmlite 0.48) crashes model load → app restart loop.
 override-dependencies = [
     "numba>=0.60",
-    "llvmlite>=0.43",
+    "llvmlite>=0.49.0rc1",
 ]
 
 [dependency-groups]

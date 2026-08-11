@@ -13,11 +13,18 @@ SERVER_DIR="$REPO_ROOT/server"
 DIST_DIR="$REPO_ROOT/dist"
 DIST_APP="$DIST_DIR/LocalDictation.app"
 
-STAGE="$REPO_ROOT/.package-build"
+# Stage under /tmp (not the repo). Repos on iCloud Drive (Mobile Documents)
+# accumulate Finder/resource-fork xattrs that make codesign fail mid-build.
+# Normalize with cd/pwd so later symlink checks match /private/var vs /var.
+_package_stage_raw="${PACKAGE_STAGE_DIR:-${TMPDIR:-/tmp}/local-dictation-package-build}"
+mkdir -p "$_package_stage_raw"
+STAGE="$(cd "$_package_stage_raw" && pwd -P)"
 APP_STAGE="$STAGE/LocalDictation.app"
 CONTENTS="$APP_STAGE/Contents"
 
-PYTHON_VERSION="3.13.13"
+# 3.12: stable numba/llvmlite wheels for parakeet-mlx. 3.13 only has llvmlite RCs
+# and a bad pin pair crashes model load (endless Warming up / Restarting).
+PYTHON_VERSION="3.12.11"
 
 log() { echo "==> $*"; }
 die() { echo "error: $*" >&2; exit 1; }
@@ -206,10 +213,14 @@ BUNDLED_PYTHON="$HELPER_LINK/bin/python3"
 
 # --- 7: locked production dependencies + local server package --------------
 
-log "Exporting locked production requirements"
+log "Exporting locked production requirements (incl. parakeet-mlx group)"
 REQS="$STAGE/requirements.txt"
-(cd "$SERVER_DIR" && uv export --frozen --no-dev --no-emit-project --format requirements.txt -o "$REQS")
+# Include optional `parakeet` group so menu provider `parakeet-mlx` works out of
+# the box without a post-install pip hack into the uv-managed bundle.
+(cd "$SERVER_DIR" && uv export --frozen --no-dev --group parakeet --no-emit-project \
+  --format requirements.txt -o "$REQS")
 [[ -s "$REQS" ]] || die "uv export produced an empty requirements file"
+grep -q 'parakeet-mlx' "$REQS" || die "parakeet-mlx missing from exported requirements (lockfile needs --group parakeet)"
 
 log "Syncing production requirements into bundled interpreter"
 # The copied uv-managed CPython ships an EXTERNALLY-MANAGED marker; this is our
@@ -310,19 +321,31 @@ done < <(find "$APP_STAGE" -type l -print0)
 #
 # iCloud Drive / Finder can attach resource forks and com.apple.* xattrs that
 # make codesign fail with "resource fork, Finder information, or similar
-# detritus not allowed". Scrub before any codesign call.
+# detritus not allowed". Scrub before every codesign call — iCloud can
+# re-stamp xattrs during a long nested-sign loop if the tree lives under
+# Mobile Documents.
+scrub_codesign_detritus() {
+  local root="$1"
+  # AppleDouble sidecars (._*) and extended attributes both trip codesign.
+  find "$root" \( -name '._*' -o -name '.DS_Store' \) -delete 2>/dev/null || true
+  xattr -cr "$root" 2>/dev/null || true
+}
+
 log "Scrubbing extended attributes / resource forks before codesign"
-xattr -cr "$APP_STAGE" 2>/dev/null || true
+scrub_codesign_detritus "$APP_STAGE"
 
 log "Code-signing nested Mach-O binaries under Helpers/LocalDictationServer.bundle ($CODESIGN_SOURCE)"
 while IFS= read -r -d '' macho; do
+  xattr -c "$macho" 2>/dev/null || true
   codesign --force --sign "$CODESIGN_IDENTITY" "$macho"
 done < <(find_macho_files "$RUNTIME_ROOT")
 
 log "Code-signing Helpers/LocalDictationServer.bundle as nested BNDL"
+scrub_codesign_detritus "$RUNTIME_ROOT"
 codesign --force --sign "$CODESIGN_IDENTITY" "$RUNTIME_ROOT"
 
 log "Code-signing main executable"
+xattr -c "$CONTENTS/MacOS/LocalDictation" 2>/dev/null || true
 codesign --force --sign "$CODESIGN_IDENTITY" "$CONTENTS/MacOS/LocalDictation"
 
 # Outer bundle carries the identity SMAppService reads. Pin the CN-anchored
@@ -331,9 +354,11 @@ codesign --force --sign "$CODESIGN_IDENTITY" "$CONTENTS/MacOS/LocalDictation"
 # Developer ID should keep codesign's own (correct) default requirement.
 if [[ "$APPLY_DESIGNATED_REQ" == true ]]; then
   log "Code-signing outer app bundle (designated requirement pinned to \"$SIGNING_IDENTITY_NAME\")"
+  scrub_codesign_detritus "$APP_STAGE"
   codesign --force --sign "$CODESIGN_IDENTITY" -r="$DESIGNATED_REQ" "$APP_STAGE"
 else
   log "Code-signing outer app bundle"
+  scrub_codesign_detritus "$APP_STAGE"
   codesign --force --sign "$CODESIGN_IDENTITY" "$APP_STAGE"
 fi
 

@@ -1,7 +1,8 @@
 import Foundation
 import os
 
-/// In-process speech runtime that loads Parakeet TDT CoreML models via FluidAudio.
+/// In-process speech runtime that loads Parakeet TDT 0.6B v3 CoreML models via
+/// FluidAudio and serves sliding-window partials (`SlidingWindowAsrManager`).
 ///
 /// Mirrors the `ServerSupervisor` lifecycle surface so `DictationController` can
 /// treat Parakeet as a drop-in alternative provider (warm on launch, idle unload,
@@ -77,6 +78,7 @@ final class ParakeetRuntime: SpeechRuntime {
         let modelPath = config.parakeetModelPath
         let directory = ParakeetEngine.resolveModelDirectory(explicitPath: modelPath)
         let willDownload = directory == nil
+        let chunkSeconds = config.parakeetChunkSeconds
 
         if willDownload {
             transition(to: .downloading(percent: nil))
@@ -87,6 +89,7 @@ final class ParakeetRuntime: SpeechRuntime {
         loadTask = Task { [weak self] in
             guard let self else { return }
             do {
+                await self.engine.setChunkSeconds(chunkSeconds)
                 try await self.engine.load(directory: directory)
                 guard !Task.isCancelled, self.loadGeneration == generation else { return }
                 guard self.desiredRunning else {
@@ -144,9 +147,9 @@ final class ParakeetRuntime: SpeechRuntime {
                 "stage models at ~/\(SpeechProvider.parakeetDefaultRepoFolder) or set parakeetModelPath in config.json"
         }
         return """
-        Parakeet (FluidAudio CoreML) failed to become ready.
+        Parakeet TDT v3 (FluidAudio CoreML) failed to become ready.
         \(error.localizedDescription)
-        Hint: \(pathHint). Provider is selected via "provider": "parakeet" in config.json.
+        Hint: \(pathHint). Stage FluidInference/parakeet-tdt-0.6b-v3-coreml or set parakeetModelPath. Provider is selected via "provider": "parakeet" in config.json.
         """
     }
 }
