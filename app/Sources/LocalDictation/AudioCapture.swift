@@ -96,18 +96,29 @@ final class AudioCapture: @unchecked Sendable {
         )
     }
 
+    /// Stop capture. The sub-chunk tail still buffered is delivered to the
+    /// handler before this returns, so the last syllable reaches the recognizer.
     func stop() {
         lock.lock()
-        defer { lock.unlock() }
-        guard isRunning else { return }
+        guard isRunning else {
+            lock.unlock()
+            return
+        }
 
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
+        let tail = pendingBuffer
+        let handler = chunkHandler
         converter = nil
         chunkHandler = nil
         pendingBuffer.removeAll(keepingCapacity: false)
         isRunning = false
-        AppLog.audio.info("Capture stopped")
+        lock.unlock()
+
+        if !tail.isEmpty {
+            handler?(tail)
+        }
+        AppLog.audio.info("Capture stopped (flushed \(tail.count) tail bytes)")
     }
 
     private func handleInputBuffer(_ buffer: AVAudioPCMBuffer) {

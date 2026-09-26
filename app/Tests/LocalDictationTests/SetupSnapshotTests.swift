@@ -45,6 +45,7 @@ struct SetupSnapshotTests {
             .accessibility,
             .inputMonitoring,
             .micKeyRemap,
+            .inputMethod,
             .dictationShortcut,
             .siriHoldF5,
         ])

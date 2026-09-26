@@ -7,8 +7,8 @@ Native, fully local dictation for macOS — a drop-in replacement for system Dic
 | Provider | Default | Runtime | Model |
 |---|---|---|---|
 | **`voxtral`** | yes | Python WebSocket server (`server/`) | Voxtral-Mini-4B-Realtime (6-bit MLX) via [voxmlx](https://github.com/awni/voxmlx) — live streaming deltas |
-| **`parakeet`** | no | In-process [FluidAudio](https://github.com/FluidInference/FluidAudio) CoreML | [Parakeet TDT 0.6B v3 CoreML](https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml) — sliding-window partials (`SlidingWindowAsrManager`, short dictation windows) |
-| **`parakeet-mlx`** | no | Python WebSocket server (`parakeet-mlx`) | [mlx-community/parakeet-tdt-0.6b-v3](https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3) — true streaming via `transcribe_stream` (often snappier partials on Apple Silicon) |
+| **`parakeet`** | no | In-process [FluidAudio](https://github.com/FluidInference/FluidAudio) CoreML | [Parakeet TDT 0.6B v3 CoreML](https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml) — live text via LocalAgreement streaming (see below) |
+| **`parakeet-mlx`** | no | Python WebSocket server (`parakeet-mlx`) | [mlx-community/parakeet-tdt-0.6b-v3](https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3) — live text via LocalAgreement streaming (see below) |
 
 The menu-bar Swift app (`app/`) always captures audio and inserts text. For `voxtral` and `parakeet-mlx` it supervises the Python speech runtime. For `parakeet` (CoreML) models load in-process (no Python for ASR).
 
@@ -137,13 +137,22 @@ Otherwise macOS will steal the mic key:
 - **Hold to Talk** (Mic Key Mode): hold **🎤** to dictate — a blue mic indicator appears at the caret; release to stop and flush trailing tokens.
 - **Press to Toggle** (default): press **🎤** to start; press again to stop and flush.
 - **⌥⌘D** and the menu Start/Stop item always toggle, regardless of mic-key mode.
-- Press **Esc** while active to cancel immediately (already-typed text stays; in terminal buffer mode the buffer is discarded).
+- Press **Esc** while active to cancel immediately (already-typed text stays).
 - Menu bar: Start/Stop, Mic Key Mode, **Speech Provider** (Voxtral ↔ Parakeet, plus **Choose Parakeet Model Folder…**), **Setup Checklist…**, Remove mic-key remap, Launch at Login, permission status, Quit.
 - Switching providers or the Parakeet model folder saves `config.json` and restarts the speech runtime in-place (no full app quit).
 
 ### Terminal mode
 
-In terminal-like apps (Terminal, iTerm2, Ghostty, Warp, kitty, Alacritty, and AX-detected shells), text is **buffered and inserted once on stop**. Newlines/tabs become spaces so a mid-stream newline cannot submit a command.
+In terminal-like apps (Terminal, iTerm2, Ghostty, Warp, kitty, Alacritty, and AX-detected shells), text still streams, but newlines/tabs become spaces so a mid-stream newline cannot submit a command.
+
+### How live text works (Parakeet)
+
+Parakeet TDT is an offline model, so both Parakeet providers stream the same way (`LocalAgreementStreamer` in Swift, `local_agreement.py` in the server):
+
+- Every `parakeetChunkSeconds` of new audio, the trailing buffer is re-transcribed with full attention. Words two consecutive passes agree on are **committed**; the last word or two stay **draft**.
+- Committed text is append-only and is never backspaced over. Only the draft tail is corrected in place — that's the "small corrections at the end". A correction that would need more than 120 backspaces is never attempted.
+- Release runs one final pass over the unagreed tail; it extends the committed text rather than rewriting it.
+- Typing stops if focus moves to another app mid-dictation, so corrections can't land in the wrong window.
 
 ## Server launch command
 
@@ -169,17 +178,15 @@ A minimal override is enough (port and model default for Voxtral):
 {"serverExecutable": "/abs/path/to/serve"}
 ```
 
-**Parakeet TDT v3 CoreML** (in-process sliding-window partials, no Python ASR):
+**Parakeet TDT v3 CoreML** (in-process, no Python ASR):
 
 ```json
 {
   "provider": "parakeet",
   "parakeetModelPath": "~/parakeet-tdt-0.6b-v3-coreml",
-  "parakeetChunkSeconds": 0.75
+  "parakeetChunkSeconds": 0.5
 }
 ```
-
-`parakeetChunkSeconds` is the sliding-window **center stride** (FluidAudio default is ~11 s for long-form; we use a short dictation window so partials appear while you hold). Smaller → more frequent partials; first update after roughly `chunk + ~0.3 s` of audio.
 
 **Parakeet MLX** (Python server, streaming):
 
@@ -197,8 +204,7 @@ Or use a Hugging Face id instead of a local path: `"model": "mlx-community/parak
 - **Python providers** (`voxtral`, `parakeet-mlx`): `serverExecutable`, `port` (default `8471`), `model` (HF id). An invalid `port` is reported rather than silently defaulted. For Parakeet MLX: `cd server && uv sync --group parakeet --python 3.12` (Python 3.12 recommended; 3.14 is not supported).
 - **CoreML keys:** `parakeetModelPath` — optional staged [FluidInference/parakeet-tdt-0.6b-v3-coreml](https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml) folder. Auto-discovers `~/parakeet-tdt-0.6b-v3-coreml` or FluidAudio cache. Menu: **Choose Parakeet CoreML Model Folder…**
 - **MLX keys:** `parakeetMlxModelPath` — optional staged [mlx-community/parakeet-tdt-0.6b-v3](https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3) folder (e.g. `~/parakeet-tdt-0.6b-v3`). Passed as `--model` so loads stay offline. Auto-discovers that home path; otherwise falls back to `model` / the default HF id. Menu: **Choose Parakeet MLX Model Folder…**
-- **`parakeetChunkSeconds`** (default `0.75`): CoreML sliding-window stride / MLX `transcribe_stream` step. Lower = snappier partials.
-- CoreML TDT uses overlapping windows (not EOU). MLX uses true streaming and is often the lower-latency partials path if you have the Python env set up. Hold-to-talk and terminal buffer mode still apply.
+- **`parakeetChunkSeconds`** (default `0.5`): seconds of new audio between live passes, clamped to 0.4–1.5. Lower = text appears sooner, but passes agree less often; below 0.4 s accuracy drops.
 - `idleUnloadMinutes` (default `10`): minutes of inactivity before unload. `0` keeps the runtime always resident.
 
 ## Server status, errors, and recovery

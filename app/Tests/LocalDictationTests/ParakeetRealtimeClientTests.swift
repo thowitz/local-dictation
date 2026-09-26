@@ -1,3 +1,4 @@
+import FluidAudio
 import Foundation
 import Testing
 @testable import LocalDictation
@@ -51,51 +52,28 @@ struct ParakeetRealtimeClientTests {
         #expect(SpeechProvider.parakeetMlxDefaultModel.contains("parakeet-tdt-0.6b-v3"))
     }
 
-    @Test("Incremental delta only grows a stable prefix")
-    func incrementalDeltaOnlyGrowsStablePrefix() {
-        #expect(
-            ParakeetRealtimeClient.incrementalDelta(full: "hello world", previouslyEmitted: "")
-                == "hello world"
-        )
-        #expect(
-            ParakeetRealtimeClient.incrementalDelta(
-                full: "hello world",
-                previouslyEmitted: "hello "
-            ) == "world"
-        )
-        // Revision of earlier text → no conflicting insert.
-        #expect(
-            ParakeetRealtimeClient.incrementalDelta(
-                full: "hi there",
-                previouslyEmitted: "hello "
-            ) == ""
-        )
-        // Second utterance must not treat first transcript as prior emit.
-        #expect(
-            ParakeetRealtimeClient.incrementalDelta(
-                full: "hello world",
-                previouslyEmitted: "hello world"
-            ) == ""
-        )
-        #expect(
-            ParakeetRealtimeClient.incrementalDelta(
-                full: "hello world",
-                previouslyEmitted: ""
-            ) == "hello world"
-        )
+    @Test("Pass cadence clamps parakeetChunkSeconds to a stable range")
+    func passCadenceClamps() {
+        #expect(ParakeetEngine.passStepSeconds(chunkSeconds: 0.35) == 0.4)
+        #expect(ParakeetEngine.passStepSeconds(chunkSeconds: 0.5) == 0.5)
+        #expect(ParakeetEngine.passStepSeconds(chunkSeconds: 9) == 1.5)
+        #expect(ParakeetEngine.passStepSeconds(chunkSeconds: 0) == 0.5)
     }
 
-    @Test("PCM16 buffer conversion yields float frames")
-    func pcm16BufferConversionYieldsFloatFrames() {
-        var pcm = Data()
-        for value: Int16 in [0, Int16.max, Int16.min, 16_384] {
-            var le = value.littleEndian
-            withUnsafeBytes(of: &le) { pcm.append(contentsOf: $0) }
-        }
-        let buffer = ParakeetEngine.makeFloatPCMBuffer(fromPCM16: pcm)
-        #expect(buffer != nil)
-        #expect(buffer?.frameLength == 4)
-        #expect(buffer?.format.sampleRate == 16_000)
+    @Test("SentencePiece token timings group into timed words")
+    func tokenTimingsGroupIntoWords() {
+        let timings = [
+            TokenTiming(token: " Hel", tokenId: 1, startTime: 0.0, endTime: 0.08, confidence: 1),
+            TokenTiming(token: "lo", tokenId: 2, startTime: 0.08, endTime: 0.16, confidence: 1),
+            TokenTiming(token: " world", tokenId: 3, startTime: 0.24, endTime: 0.4, confidence: 1),
+            TokenTiming(token: ".", tokenId: 4, startTime: 0.4, endTime: 0.48, confidence: 1),
+        ]
+        #expect(
+            ParakeetEngine.words(from: timings) == [
+                TimedWord(text: "Hello", start: 0.0, end: 0.16),
+                TimedWord(text: "world.", start: 0.24, end: 0.48),
+            ]
+        )
     }
 
     @Test("Staged Parakeet TDT model loads when present on disk")

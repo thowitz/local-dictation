@@ -17,6 +17,9 @@ enum SetupStepID: String, CaseIterable, Equatable, Sendable {
     case accessibility
     case inputMonitoring
     case micKeyRemap
+    /// The Local Dictation input source (marked-text insertion). macOS
+    /// requires the user to approve a third-party input source once.
+    case inputMethod
     case dictationShortcut
     case siriHoldF5
 }
@@ -64,6 +67,7 @@ struct SetupSnapshot: Equatable, Sendable {
     var siriHoldF5ConfirmedOff: Bool
     var openFailurePath: String?
     var actionError: String?
+    var inputMethodEnabled: Bool = true
 
     var stepOrder: [SetupStepID] { SetupStepID.allCases }
 
@@ -82,6 +86,8 @@ struct SetupSnapshot: Equatable, Sendable {
             }
             // Session-only must not leave a loaded/present app-owned agent.
             return launchAgentStatus == .absent
+        case .inputMethod:
+            return inputMethodEnabled
         case .dictationShortcut:
             return firstRunReport.dictationShortcut == .disabled || dictationShortcutConfirmedOff
         case .siriHoldF5:
@@ -136,6 +142,8 @@ struct SetupSnapshot: Equatable, Sendable {
                 }
             }
             return "\(mapping) · \(persistence)"
+        case .inputMethod:
+            return inputMethodEnabled ? "Enabled" : "Not added — needs your approval once"
         case .dictationShortcut:
             switch firstRunReport.dictationShortcut {
             case .enabled: return dictationShortcutConfirmedOff ? "Confirmed off (probe still on)" : "Detected on"
@@ -166,12 +174,14 @@ enum SystemSettingsLinks {
     )!
     static var dictationURL: URL { FirstRunChecks.dictationSettingsURL }
     static var siriURL: URL { FirstRunChecks.siriSettingsURL }
+    static let keyboardURL = URL(string: "x-apple.systempreferences:com.apple.Keyboard-Settings.extension")!
 
     static let microphonePath = "Privacy & Security → Microphone"
     static let accessibilityPath = "Privacy & Security → Accessibility"
     static let inputMonitoringPath = "Privacy & Security → Input Monitoring"
     static let dictationPath = "Keyboard → Dictation → Shortcut"
     static let siriPath = "Apple Intelligence & Siri → press-and-hold for Siri"
+    static let inputMethodPath = "Keyboard → Text Input → Input Sources → Edit… → + → English → Local Dictation"
 
     static func manualPath(for step: SetupStepID) -> String? {
         switch step {
@@ -180,6 +190,7 @@ enum SystemSettingsLinks {
         case .inputMonitoring: return inputMonitoringPath
         case .dictationShortcut: return dictationPath
         case .siriHoldF5: return siriPath
+        case .inputMethod: return inputMethodPath
         case .micKeyRemap: return nil
         }
     }
@@ -331,6 +342,9 @@ struct OnboardingDependencies {
     var installLaunchAgent: () throws -> Void
     var removeRemap: () throws -> Void
     var removeLaunchAgent: () throws -> Void
+    var inputMethodEnabled: () -> Bool = { true }
+    /// Install/register the input method and ask macOS to enable it.
+    var enableInputMethod: () -> Void = {}
 
     static func production(micKeyManager: MicKeyManager) -> OnboardingDependencies {
         OnboardingDependencies(
@@ -352,7 +366,9 @@ struct OnboardingDependencies {
             installAndVerifyRemap: { micKeyManager.installAndVerifyRemap() },
             installLaunchAgent: { try micKeyManager.installLaunchAgent() },
             removeRemap: { try micKeyManager.removeRemap() },
-            removeLaunchAgent: { try micKeyManager.removeLaunchAgent() }
+            removeLaunchAgent: { try micKeyManager.removeLaunchAgent() },
+            inputMethodEnabled: { InputMethodInstaller.isEnabled() },
+            enableInputMethod: { InputMethodInstaller.requestEnable() }
         )
     }
 }
@@ -465,6 +481,10 @@ final class OnboardingCoordinator: ObservableObject {
             }
         case .micKeyRemap:
             await installRemapFromSetup()
+        case .inputMethod:
+            deps.enableInputMethod()
+            openSettings(SystemSettingsLinks.keyboardURL, path: SystemSettingsLinks.inputMethodPath)
+            refresh()
         case .dictationShortcut:
             openSettings(SystemSettingsLinks.dictationURL, path: SystemSettingsLinks.dictationPath)
         case .siriHoldF5:
@@ -641,7 +661,8 @@ final class OnboardingCoordinator: ObservableObject {
             dictationShortcutConfirmedOff: preferences.dictationShortcutConfirmedOff,
             siriHoldF5ConfirmedOff: preferences.siriHoldF5ConfirmedOff,
             openFailurePath: openFailurePath,
-            actionError: actionError
+            actionError: actionError,
+            inputMethodEnabled: dependencies.inputMethodEnabled()
         )
     }
 }

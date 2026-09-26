@@ -26,20 +26,24 @@ struct AppConfig: Codable, Sendable {
     /// so loads skip Hugging Face. Falls back to `model` / default HF id.
     var parakeetMlxModelPath: String?
 
-    /// Sliding-window center stride (CoreML) / stream step (MLX) in seconds.
-    /// Default `0.75`. Smaller → more frequent partials (noisier). CoreML maps
-    /// this to FluidAudio `SlidingWindowAsrConfig.chunkSeconds` (clamped).
+    /// Parakeet live-pass cadence in seconds (CoreML and MLX): how much new
+    /// audio arrives between re-transcriptions. Default `0.5`; the runtimes
+    /// clamp to 0.4–1.5 s (shorter passes disagree too often to commit words).
     var parakeetChunkSeconds: Double
 
     /// Minutes of inactivity before unloading the speech runtime.
     /// `0` disables unload; omitted/negative values resolve to `defaultIdleUnloadMinutes`.
     var idleUnloadMinutes: Double
 
+    /// Insert through the Local Dictation input method (marked text, like
+    /// system dictation). `false` types synthetic keystrokes instead.
+    var useInputMethod: Bool
+
     static let defaultPort = 8471
     static let defaultIdleUnloadMinutes: Double = 10
     /// Default sliding-window / MLX stream stride for live partials.
     /// CoreML TDT needs ≥ ~1 s centers for stable windows; 1.5 s is a good default.
-    static let defaultParakeetChunkSeconds: Double = 1.5
+    static let defaultParakeetChunkSeconds: Double = 0.5
     static let defaultProvider: SpeechProvider = .voxtral
     static let supportDirectoryName = "LocalDictation"
     static let configFileName = "config.json"
@@ -53,6 +57,7 @@ struct AppConfig: Codable, Sendable {
         case parakeetMlxModelPath
         case parakeetChunkSeconds
         case idleUnloadMinutes
+        case useInputMethod
     }
 
     enum ValidationError: Error, Equatable, CustomStringConvertible {
@@ -86,7 +91,8 @@ struct AppConfig: Codable, Sendable {
         parakeetModelPath: String? = nil,
         parakeetMlxModelPath: String? = nil,
         parakeetChunkSeconds: Double = defaultParakeetChunkSeconds,
-        idleUnloadMinutes: Double = defaultIdleUnloadMinutes
+        idleUnloadMinutes: Double = defaultIdleUnloadMinutes,
+        useInputMethod: Bool = true
     ) {
         self.serverExecutable = serverExecutable
         self.port = port
@@ -96,6 +102,7 @@ struct AppConfig: Codable, Sendable {
         self.parakeetMlxModelPath = parakeetMlxModelPath
         self.parakeetChunkSeconds = Self.normalizedChunkSeconds(parakeetChunkSeconds)
         self.idleUnloadMinutes = Self.normalizedIdleUnloadMinutes(idleUnloadMinutes)
+        self.useInputMethod = useInputMethod
     }
 
     init(from decoder: Decoder) throws {
@@ -119,6 +126,7 @@ struct AppConfig: Codable, Sendable {
         )
         let rawIdle = try container.decodeIfPresent(Double.self, forKey: .idleUnloadMinutes)
         idleUnloadMinutes = Self.normalizedIdleUnloadMinutes(rawIdle ?? Self.defaultIdleUnloadMinutes)
+        useInputMethod = try container.decodeIfPresent(Bool.self, forKey: .useInputMethod) ?? true
     }
 
     func encode(to encoder: Encoder) throws {
@@ -131,6 +139,7 @@ struct AppConfig: Codable, Sendable {
         try container.encodeIfPresent(parakeetMlxModelPath, forKey: .parakeetMlxModelPath)
         try container.encode(parakeetChunkSeconds, forKey: .parakeetChunkSeconds)
         try container.encode(idleUnloadMinutes, forKey: .idleUnloadMinutes)
+        try container.encode(useInputMethod, forKey: .useInputMethod)
     }
 
     /// Effective idle timeout, or `nil` when unload is disabled (`idleUnloadMinutes == 0`).

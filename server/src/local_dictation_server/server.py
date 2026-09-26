@@ -532,8 +532,8 @@ def main():
     parser.add_argument(
         "--chunk-seconds",
         type=float,
-        default=1.0,
-        help="Parakeet-mlx partial chunk size in seconds (default 1.0)",
+        default=0.5,
+        help="Parakeet-mlx live-pass cadence in seconds, clamped 0.4-1.5 (default 0.5)",
     )
     parser.add_argument("--port", type=int, default=8471, help="Port to listen on")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind to")

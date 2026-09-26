@@ -114,6 +114,15 @@ BIN_PATH="$(cd "$APP_DIR" && swift build -c release --show-bin-path)"
 cp "$BIN_PATH/LocalDictation" "$CONTENTS/MacOS/LocalDictation"
 chmod +x "$CONTENTS/MacOS/LocalDictation"
 
+# --- 3b: input method (marked-text insertion, like system dictation) ---------
+# Shipped inside the app; installed into ~/Library/Input Methods on first use.
+
+log "Building input method bundle"
+IME_OUT="$(mktemp -d)"
+CODESIGN_IDENTITY="${CODESIGN_IDENTITY:-}" "$REPO_ROOT/scripts/build-input-method.sh" --release --out "$IME_OUT" >/dev/null
+ditto "$IME_OUT/LocalDictationInput.app" "$CONTENTS/Helpers/LocalDictationInput.app"
+rm -rf "$IME_OUT"
+
 # --- 4: Info.plist -----------------------------------------------------------
 
 log "Copying Info.plist"
@@ -343,6 +352,10 @@ done < <(find_macho_files "$RUNTIME_ROOT")
 log "Code-signing Helpers/LocalDictationServer.bundle as nested BNDL"
 scrub_codesign_detritus "$RUNTIME_ROOT"
 codesign --force --sign "$CODESIGN_IDENTITY" "$RUNTIME_ROOT"
+
+log "Code-signing Helpers/LocalDictationInput.app (input method)"
+scrub_codesign_detritus "$CONTENTS/Helpers/LocalDictationInput.app"
+codesign --force --sign "$CODESIGN_IDENTITY" "$CONTENTS/Helpers/LocalDictationInput.app"
 
 log "Code-signing main executable"
 xattr -c "$CONTENTS/MacOS/LocalDictation" 2>/dev/null || true

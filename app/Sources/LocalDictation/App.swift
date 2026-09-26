@@ -102,6 +102,8 @@ final class DictationController {
         var stopAudio: (() -> Void)?
         /// When false, skip AppKit indicator / Esc hotkey side effects (unit tests).
         var presentsSessionUI: Bool
+        /// Test seam: capture typing edits instead of posting keystrokes.
+        var typeEdit: ((TypingEdit) -> Void)? = nil
 
         @MainActor
         static func production() -> Dependencies {
@@ -141,7 +143,16 @@ final class DictationController {
         requiresReleaseToRearm: false
     )
 
-    private var sessionTranscript = ""
+    /// Single owner of what this session puts into the focused app.
+    private var insertion: InsertionSession?
+    /// Marked-text insertion via the bundled input method (nil: keystrokes only).
+    private lazy var inputMethod: InputMethodInserter? =
+        config.useInputMethod && deps.typeEdit == nil ? InputMethodInserter() : nil
+    private let audioGate = AudioGate()
+    /// Realtime callbacks arrive on arbitrary threads; one FIFO stream drained
+    /// on the main actor keeps transcript, done, and connection events in order.
+    private let events: AsyncStream<RealtimeEvent>.Continuation
+    private var eventPump: Task<Void, Never>?
     private var intent = DictationIntentTracker()
     private var cancellationBarrier = CancellationBarrier()
     private var indicatorActive = false
@@ -165,6 +176,8 @@ final class DictationController {
     ) {
         self.config = config
         self.deps = dependencies
+        let (stream, continuation) = AsyncStream.makeStream(of: RealtimeEvent.self)
+        self.events = continuation
 
         // Production wiring: pick Voxtral (Python WS) or Parakeet (in-process CoreML).
         // Tests inject both seams explicitly.
@@ -200,41 +213,56 @@ final class DictationController {
             }
         }
 
+        let events = self.events
         self.realtime.setCallbacks(
             RealtimeClient.Callbacks(
-                onDelta: { [weak self] text, absolute in
-                    Task { @MainActor in
-                        self?.handleDelta(text, absolute: absolute)
-                    }
-                },
-                onDone: { [weak self] transcript in
-                    Task { @MainActor in
-                        self?.handleDone(transcript)
-                    }
-                },
-                onConnectionState: { [weak self] connection in
-                    Task { @MainActor in
-                        self?.handleConnectionState(connection)
-                    }
-                },
-                onError: { [weak self] message in
-                    Task { @MainActor in
-                        AppLog.general.error("Realtime error: \(message, privacy: .public)")
-                        if self?.state == .listening || self?.state == .flushing {
-                            self?.intent.clearAll()
-                            self?.cancellationBarrier.reset()
-                            self?.endIndicatorSession(playSound: true)
-                            self?.transition(to: .failed(.app(message)))
-                        }
-                    }
-                },
-                onBufferCleared: { [weak self] in
-                    Task { @MainActor in
-                        self?.handleBufferCleared()
-                    }
-                }
+                onTranscript: { events.yield(.transcript($0)) },
+                onDone: { events.yield(.done($0)) },
+                onConnectionState: { events.yield(.connection($0)) },
+                onError: { events.yield(.error($0)) },
+                onBufferCleared: { events.yield(.bufferCleared) }
             )
         )
+        eventPump = Task { @MainActor [weak self, stream] in
+            for await event in stream {
+                self?.handle(event)
+            }
+        }
+    }
+
+    isolated deinit {
+        events.finish()
+        eventPump?.cancel()
+    }
+
+    private enum RealtimeEvent: Sendable {
+        case transcript(TranscriptEvent)
+        case done(String)
+        case connection(RealtimeClient.ConnectionState)
+        case error(String)
+        case bufferCleared
+    }
+
+    private func handle(_ event: RealtimeEvent) {
+        switch event {
+        case .transcript(let transcript):
+            handleTranscript(transcript)
+        case .done(let transcript):
+            handleDone(transcript)
+        case .connection(let connection):
+            handleConnectionState(connection)
+        case .error(let message):
+            AppLog.general.error("Realtime error: \(message, privacy: .public)")
+            if state == .listening || state == .flushing {
+                intent.clearAll()
+                cancellationBarrier.reset()
+                audioGate.close()
+                endIndicatorSession(playSound: true)
+                transition(to: .failed(.app(message)))
+            }
+        case .bufferCleared:
+            handleBufferCleared()
+        }
     }
 
     /// Builds a matched runtime + client pair for the configured provider.
@@ -297,8 +325,9 @@ final class DictationController {
         cancellationBarrier.reset()
         escapeHotKey.unregister()
         stopAudioCapture()
-        textInserter.discard()
-        sessionTranscript = ""
+        audioGate.close()
+        insertion?.cancel()
+        insertion = nil
         endIndicatorSession(playSound: false)
         realtime.disconnect()
         supervisor.stop(reason: .applicationQuit)
@@ -419,12 +448,15 @@ final class DictationController {
         intent.clearAll()
         transition(to: .flushing)
         updateIndicatorProcessing()
+        // Capture delivers its buffered tail synchronously through the gate;
+        // closing it guarantees commit follows every chunk and nothing later.
         stopAudioCapture()
+        audioGate.close()
         if !realtime.commitFinal() {
             AppLog.general.error("commitFinal enqueue failed — tearing down locally")
             escapeHotKey.unregister()
-            textInserter.discard()
-            sessionTranscript = ""
+            insertion?.cancel()
+            insertion = nil
             endIndicatorSession(playSound: true)
             if realtime.isConnected, case .running = supervisor.state {
                 transition(to: .ready)
@@ -443,8 +475,9 @@ final class DictationController {
         intent.clearAll()
         escapeHotKey.unregister()
         stopAudioCapture()
-        textInserter.discard()
-        sessionTranscript = ""
+        audioGate.close()
+        insertion?.cancel()
+        insertion = nil
         endIndicatorSession(playSound: true)
 
         cancellationBarrier.beginCancel()
@@ -530,19 +563,21 @@ final class DictationController {
             return
         }
 
-        sessionTranscript = ""
         textInserter.beginSession()
+        let insertion = InsertionSession(textInserter: textInserter, inputMethod: inputMethod, typeEdit: deps.typeEdit)
+        insertion.begin()
+        self.insertion = insertion
 
+        let realtime = self.realtime
+        audioGate.open { chunk in realtime.sendAudio(chunk) }
         do {
-            let sendAudio: @Sendable (Data) -> Void = { [weak self] chunk in
-                Task { @MainActor in
-                    self?.realtime.sendAudio(chunk)
-                }
-            }
-            try startAudioCapture(sendAudio)
+            let gate = audioGate
+            try startAudioCapture { chunk in gate.forward(chunk) }
         } catch {
             intent.clearAll()
-            textInserter.discard()
+            audioGate.close()
+            self.insertion?.cancel()
+            self.insertion = nil
             transition(to: .failed(.app(error.localizedDescription)))
             return
         }
@@ -555,7 +590,7 @@ final class DictationController {
         }
         transition(to: .listening)
         AppLog.general.info(
-            "Dictation started — mode=\(self.textInserter.mode.rawValue, privacy: .public)"
+            "Dictation started — route=\(String(describing: insertion.route), privacy: .public) stripLineBreaks=\(self.textInserter.stripLineBreaks, privacy: .public)"
         )
     }
 
@@ -678,8 +713,9 @@ final class DictationController {
         cancellationBarrier.reset()
         escapeHotKey.unregister()
         stopAudioCapture()
-        textInserter.discard()
-        sessionTranscript = ""
+        audioGate.close()
+        insertion?.cancel()
+        insertion = nil
         endIndicatorSession(playSound: true)
         realtime.disconnect()
     }
@@ -704,7 +740,9 @@ final class DictationController {
                 intent.interruptActiveSession()
                 escapeHotKey.unregister()
                 stopAudioCapture()
-                textInserter.discard()
+                audioGate.close()
+                insertion?.cancel()
+                insertion = nil
                 endIndicatorSession(playSound: true)
                 transition(to: .starting)
             } else if state == .ready {
@@ -713,64 +751,34 @@ final class DictationController {
             } else if state == .flushing {
                 intent.clearAll()
                 escapeHotKey.unregister()
-                textInserter.discard()
+                insertion?.cancel()
+                insertion = nil
                 endIndicatorSession(playSound: true)
                 transition(to: .starting)
             }
         }
     }
 
-    private func handleDelta(_ text: String, absolute: Bool = false) {
+    private func handleTranscript(_ event: TranscriptEvent) {
         guard cancellationBarrier.shouldAcceptTranscript(phase: transcriptSessionPhase) else { return }
-        guard !text.isEmpty || absolute else { return }
-
-        if absolute {
-            // Parakeet MLX draft snapshots revise freely — reconcile typed text.
-            // Terminal sessions strip newlines first so tracking matches keystrokes.
-            let previous = sessionTranscript
-            print("[transcript absolute] \(text)")
-            AppLog.general.info(
-                "absolute partial chars=\(text.count, privacy: .public) prev=\(previous.count, privacy: .public)"
-            )
-            sessionTranscript = textInserter.applyLiveTranscript(
-                previouslyEmitted: previous,
-                text: text
-            )
-            return
-        }
-
-        let prepared = textInserter.prepared(text)
-        guard !prepared.isEmpty else { return }
-        sessionTranscript += prepared
-        print("[transcript delta] \(prepared)")
-        AppLog.general.info("delta: \(prepared, privacy: .public)")
-        textInserter.handleDelta(text)
+        insertion?.transcript(event)
     }
 
     private func handleDone(_ transcript: String) {
         guard cancellationBarrier.shouldAcceptTranscript(phase: transcriptSessionPhase) else { return }
-        // Prefer server final text; fall back to what we already streamed.
-        let finalText = transcript.isEmpty ? sessionTranscript : transcript
-        let previouslyEmitted = sessionTranscript
-        print("[transcript done] \(finalText)")
-        AppLog.general.info(
-            "done: \(finalText, privacy: .public) previously=\(previouslyEmitted.count, privacy: .public) chars"
-        )
+        AppLog.general.info("done: \(transcript.count, privacy: .public) chars")
 
         if state == .flushing {
-            // Stream mode previously ignored done.text (only live deltas typed),
-            // so sticky draft hallucinations (\"yeah\") were never corrected.
-            // Buffer mode replaces the accumulated buffer with the final text.
-            let inserted = textInserter.commitFinal(
-                previouslyEmitted: previouslyEmitted,
-                finalText: finalText
-            )
-            if !inserted.isEmpty {
-                AppLog.general.info(
-                    "final commit inserted/reconciled \(inserted.count, privacy: .public) chars stripLineBreaks=\(self.textInserter.stripLineBreaks, privacy: .public)"
-                )
+            if let insertion {
+                // Final text only edits provisional text (marked, or the typist's draft tail).
+                insertion.finish(finalText: transcript)
+                if insertion.realignCount > 0 {
+                    AppLog.general.info(
+                        "session needed \(insertion.realignCount, privacy: .public) bounded-revision fallback(s)"
+                    )
+                }
             }
-            sessionTranscript = ""
+            insertion = nil
             intent.clearAll()
             escapeHotKey.unregister()
             endIndicatorSession(playSound: true)
@@ -781,7 +789,9 @@ final class DictationController {
                 transition(to: .starting)
             }
         } else {
-            sessionTranscript = ""
+            // Voxtral hit end-of-speech mid-session: its next deltas restart
+            // from empty, so keep what is shown and start a new segment.
+            insertion?.newSegment(finalText: transcript)
         }
     }
 

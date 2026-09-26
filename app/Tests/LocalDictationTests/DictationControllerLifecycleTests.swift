@@ -3,7 +3,7 @@ import Foundation
 import Testing
 @testable import LocalDictation
 
-final class FakeRealtimeClient: DictationRealtimeClient {
+final class FakeRealtimeClient: DictationRealtimeClient, @unchecked Sendable {
     private(set) var connectionState: RealtimeClient.ConnectionState = .disconnected
     private(set) var connectCount = 0
     private(set) var disconnectCount = 0
@@ -54,6 +54,10 @@ final class FakeRealtimeClient: DictationRealtimeClient {
         callbacks.onDone?(transcript)
     }
 
+    func emitTranscript(_ event: TranscriptEvent) {
+        callbacks.onTranscript?(event)
+    }
+
     /// Idle transport loss (not an intentional `disconnect()`).
     func simulateTransportDrop() {
         eventLog.append("drop")
@@ -83,7 +87,9 @@ struct DictationControllerLifecycleTests {
             isAccessibilityTrusted: { true },
             startAudio: { _ in },
             stopAudio: {},
-            presentsSessionUI: false
+            presentsSessionUI: false,
+            // Never post real keystrokes from unit tests.
+            typeEdit: { _ in }
         )
         let controller = DictationController(
             config: config,

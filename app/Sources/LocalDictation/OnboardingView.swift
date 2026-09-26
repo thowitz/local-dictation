@@ -125,6 +125,7 @@ struct OnboardingView: View {
         case .accessibility: return "Accessibility"
         case .inputMonitoring: return "Input Monitoring"
         case .micKeyRemap: return "Mic-key remap"
+        case .inputMethod: return "Local Dictation input source"
         case .dictationShortcut: return "System Dictation shortcut"
         case .siriHoldF5: return "Siri press-and-hold F5"
         }
@@ -140,6 +141,7 @@ struct OnboardingView: View {
         case .accessibility: return "Open Accessibility Settings"
         case .inputMonitoring: return "Open Input Monitoring"
         case .micKeyRemap: return "Install/Test Remap"
+        case .inputMethod: return "Add Input Source"
         case .dictationShortcut: return "Open Dictation Settings"
         case .siriHoldF5: return "Open Siri Settings"
         }

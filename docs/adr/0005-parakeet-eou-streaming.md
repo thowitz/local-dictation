@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted (supersedes the short-lived EOU experiment, 2026-08-10)
+Superseded by 0006 (streaming); model choice still stands.
 
 ## Context
 

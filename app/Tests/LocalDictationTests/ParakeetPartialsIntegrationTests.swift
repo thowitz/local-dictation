@@ -3,8 +3,9 @@ import Foundation
 import Testing
 @testable import LocalDictation
 
-/// Verifies Parakeet EOU true streaming emits growing partials while audio is
-/// streamed, then finalizes cleanly on commit. Skips when models / `say` are missing.
+/// Verifies Parakeet TDT CoreML LocalAgreement streaming emits snapshots while
+/// audio is streamed — committed text only ever grows, and the final text
+/// extends it (no release-time rewrite). Skips when models / `say` are missing.
 @Suite("ParakeetPartialsIntegration", .serialized)
 struct ParakeetPartialsIntegrationTests {
     @Test("Partials emit before commit on multi-second speech")
@@ -34,7 +35,7 @@ struct ParakeetPartialsIntegrationTests {
         let collector = DeltaCollector()
         client.setCallbacks(
             RealtimeClient.Callbacks(
-                onDelta: { delta, _ in collector.appendDelta(delta) },
+                onTranscript: { event in collector.append(event) },
                 onDone: { text in collector.markDone(text) },
                 onError: { message in collector.markError(message) }
             )
@@ -62,6 +63,8 @@ struct ParakeetPartialsIntegrationTests {
         try await Task.sleep(for: .seconds(2))
         let partialCountBeforeCommit = collector.deltaCount
         let partialJoined = collector.joinedDeltas
+        let committedBeforeCommit = collector.lastCommitted
+        #expect(collector.committedWasAppendOnly, "committed text was revised: \(collector.committedHistory)")
 
         #expect(
             partialCountBeforeCommit >= 1,
@@ -90,13 +93,16 @@ struct ParakeetPartialsIntegrationTests {
             "Final text \(haystack.debugDescription) matched too few expected words from phrase (hits=\(hits))"
         )
 
-        // Partials must be a prefix path into the final transcript (or equal).
+        // Final text extends everything already committed: release never
+        // rewrites locked text.
+        #expect(
+            finalText.hasPrefix(committedBeforeCommit),
+            "Final \(finalText.debugDescription) does not extend committed \(committedBeforeCommit.debugDescription)"
+        )
         if !partialJoined.isEmpty, !finalText.isEmpty {
             #expect(
-                finalText.hasPrefix(partialJoined) || partialJoined.hasPrefix(finalText)
-                    || finalText == partialJoined
-                    || Self.shareLongPrefix(partialJoined, finalText) >= 4,
-                "Partial text \(partialJoined.debugDescription) diverged from final \(finalText.debugDescription)"
+                Self.shareLongPrefix(partialJoined, finalText) >= 4,
+                "Live text \(partialJoined.debugDescription) diverged from final \(finalText.debugDescription)"
             )
         }
 
@@ -119,7 +125,7 @@ struct ParakeetPartialsIntegrationTests {
         let collector = DeltaCollector()
         client.setCallbacks(
             RealtimeClient.Callbacks(
-                onDelta: { delta, _ in collector.appendDelta(delta) },
+                onTranscript: { event in collector.append(event) },
                 onDone: { text in collector.markDone(text) },
                 onError: { message in collector.markError(message) }
             )
@@ -190,7 +196,7 @@ struct ParakeetPartialsIntegrationTests {
 
 private final class DeltaCollector: @unchecked Sendable {
     private let lock = NSLock()
-    private var deltas: [String] = []
+    private var snapshots: [TranscriptSnapshot] = []
     private(set) var doneText: String?
     private(set) var errorMessage: String?
 
@@ -199,19 +205,38 @@ private final class DeltaCollector: @unchecked Sendable {
         return doneText != nil
     }
 
+    /// Number of live snapshots received.
     var deltaCount: Int {
         lock.lock(); defer { lock.unlock() }
-        return deltas.count
+        return snapshots.count
     }
 
+    /// Latest visible text (committed + draft).
     var joinedDeltas: String {
         lock.lock(); defer { lock.unlock() }
-        return deltas.joined()
+        guard let last = snapshots.last else { return "" }
+        return [last.committed, last.draft].filter { !$0.isEmpty }.joined(separator: " ")
     }
 
-    func appendDelta(_ delta: String) {
+    var lastCommitted: String {
+        lock.lock(); defer { lock.unlock() }
+        return snapshots.last?.committed ?? ""
+    }
+
+    var committedHistory: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return snapshots.map(\.committed)
+    }
+
+    var committedWasAppendOnly: Bool {
+        let history = committedHistory
+        return zip(history, history.dropFirst()).allSatisfy { $1.hasPrefix($0) }
+    }
+
+    func append(_ event: TranscriptEvent) {
+        guard case .snapshot(let snapshot) = event else { return }
         lock.lock()
-        deltas.append(delta)
+        snapshots.append(snapshot)
         lock.unlock()
     }
 
@@ -229,7 +254,7 @@ private final class DeltaCollector: @unchecked Sendable {
 
     func resetForNextUtterance() {
         lock.lock()
-        deltas = []
+        snapshots = []
         doneText = nil
         errorMessage = nil
         lock.unlock()

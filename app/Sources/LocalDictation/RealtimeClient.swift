@@ -1,6 +1,14 @@
 import Foundation
 import os
 
+/// Transcript progress delivered by a realtime client.
+enum TranscriptEvent: Equatable, Sendable {
+    /// Append-only text (Voxtral token deltas).
+    case append(String)
+    /// Full committed (append-only) text plus the revisable draft (Parakeet).
+    case snapshot(TranscriptSnapshot)
+}
+
 /// Persistent WebSocket client for the OpenAI Realtime subset spoken by the
 /// local-dictation Python server.
 final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
@@ -11,9 +19,8 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
     }
 
     struct Callbacks: Sendable {
-        /// Incremental append (Voxtral) or absolute draft snapshot (Parakeet MLX).
-        /// `absolute == true` means `text` is the full transcript so far and may revise.
-        var onDelta: (@Sendable (_ text: String, _ absolute: Bool) -> Void)?
+        /// Transcript progress for the active utterance.
+        var onTranscript: (@Sendable (TranscriptEvent) -> Void)?
         var onDone: (@Sendable (String) -> Void)?
         var onConnectionState: (@Sendable (ConnectionState) -> Void)?
         var onError: (@Sendable (String) -> Void)?
@@ -179,11 +186,26 @@ final class RealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Se
         lock.unlock()
 
         switch type {
+        case "transcript.snapshot":
+            cbs.onTranscript?(
+                .snapshot(
+                    TranscriptSnapshot(
+                        committed: json["committed"] as? String ?? "",
+                        draft: json["draft"] as? String ?? "",
+                        finalized: json["finalized"] as? String,
+                        volatile: json["volatile"] as? String
+                    )
+                )
+            )
         case "response.audio_transcript.delta",
              "transcription.delta":
             if let delta = json["delta"] as? String ?? json["text"] as? String ?? json["transcript"] as? String {
-                let absolute = (json["absolute"] as? Bool) ?? false
-                cbs.onDelta?(delta, absolute)
+                if (json["absolute"] as? Bool) == true {
+                    // Legacy Parakeet server: a revisable full draft, nothing committed.
+                    cbs.onTranscript?(.snapshot(TranscriptSnapshot(committed: "", draft: delta)))
+                } else {
+                    cbs.onTranscript?(.append(delta))
+                }
             }
         case "response.audio_transcript.done",
              "transcription.done":
