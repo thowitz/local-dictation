@@ -1,0 +1,42 @@
+[
+ {
+  "engine": "mb-coreml-redux",
+  "load_s": 586.0,
+  "wer_clean": 2.22,
+  "wer_other": 4.06,
+  "rtfx": 30.9,
+  "wer_stream_final": 3.3,
+  "pass_p50_ms": 221,
+  "pass_p95_ms": 344
+ },
+ {
+  "engine": "mb-coreml-ultra",
+  "load_s": 21.9,
+  "wer_clean": 1.48,
+  "wer_other": 3.16,
+  "rtfx": 43.6,
+  "wer_stream_final": 3.14,
+  "pass_p50_ms": 173,
+  "pass_p95_ms": 267
+ },
+ {
+  "engine": "mb-coreml-v3",
+  "load_s": 27.3,
+  "wer_clean": 3.06,
+  "wer_other": 3.83,
+  "rtfx": 43.3,
+  "wer_stream_final": 4.95,
+  "pass_p50_ms": 162,
+  "pass_p95_ms": 262
+ },
+ {
+  "engine": "mb-mlx-v3",
+  "load_s": 2.4,
+  "wer_clean": 1.58,
+  "wer_other": 3.04,
+  "rtfx": 63.5,
+  "wer_stream_final": 3.63,
+  "pass_p50_ms": 128,
+  "pass_p95_ms": 243
+ }
+]

@@ -1,0 +1,26 @@
+[
+ {
+  "engine": "coreml-ultra-german",
+  "load_s": 0.4,
+  "wer_de": 6.53,
+  "rtfx": 64.5
+ },
+ {
+  "engine": "coreml-v3-german",
+  "load_s": 0.2,
+  "wer_de": 7.41,
+  "rtfx": 65.1
+ },
+ {
+  "engine": "mlx-ultra-german",
+  "load_s": 1.9,
+  "wer_de": 6.01,
+  "rtfx": 15.7
+ },
+ {
+  "engine": "mlx-v3-german",
+  "load_s": 1.4,
+  "wer_de": 7.0,
+  "rtfx": 16.6
+ }
+]

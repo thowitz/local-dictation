@@ -1,0 +1,23 @@
+[
+ {
+  "engine": "coreml-v3-long-fa174",
+  "load_s": 0.6,
+  "wer_clean": 3.25,
+  "wer_other": 3.54,
+  "rtfx": 43.2
+ },
+ {
+  "engine": "coreml-v3new-long",
+  "load_s": 28.8,
+  "wer_clean": 11.44,
+  "wer_other": 12.4,
+  "rtfx": 70.6
+ },
+ {
+  "engine": "coreml-v3old-long",
+  "load_s": 0.3,
+  "wer_clean": 11.44,
+  "wer_other": 12.4,
+  "rtfx": 66.5
+ }
+]

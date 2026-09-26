@@ -1,0 +1,58 @@
+[
+ {
+  "engine": "apple-speech-noise",
+  "load_s": 0,
+  "wer_snr0": 63.72,
+  "wer_snr10": 10.26,
+  "wer_snr5": 25.44,
+  "rtfx": 29.2
+ },
+ {
+  "engine": "coreml-ultra-noise",
+  "load_s": 0.4,
+  "wer_snr0": 39.3,
+  "wer_snr10": 4.51,
+  "wer_snr5": 12.12,
+  "rtfx": 40.2
+ },
+ {
+  "engine": "coreml-v2-noise",
+  "load_s": 0.4,
+  "wer_snr0": 56.88,
+  "wer_snr10": 6.15,
+  "wer_snr5": 18.3,
+  "rtfx": 44.3
+ },
+ {
+  "engine": "coreml-v3-noise",
+  "load_s": 0.3,
+  "wer_snr0": 53.6,
+  "wer_snr10": 6.51,
+  "wer_snr5": 18.27,
+  "rtfx": 34.6
+ },
+ {
+  "engine": "mlx-ultra-noise",
+  "load_s": 1.5,
+  "wer_snr0": 38.97,
+  "wer_snr10": 4.48,
+  "wer_snr5": 11.68,
+  "rtfx": 11.9
+ },
+ {
+  "engine": "mlx-v2-noise",
+  "load_s": 1.4,
+  "wer_snr0": 51.75,
+  "wer_snr10": 5.64,
+  "wer_snr5": 15.83,
+  "rtfx": 11.9
+ },
+ {
+  "engine": "mlx-v3-noise",
+  "load_s": 1.4,
+  "wer_snr0": 50.98,
+  "wer_snr10": 6.11,
+  "wer_snr5": 15.94,
+  "rtfx": 10.7
+ }
+]
