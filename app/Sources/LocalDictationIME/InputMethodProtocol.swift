@@ -39,13 +39,18 @@ public struct InputMethodRequest: Codable, Sendable, Equatable {
     public var volatile: String?
     /// Ask for the focused field's full text in the reply (tests/diagnostics).
     public var readBack: Bool
+    /// `begin` only: the target is a terminal, whose reported text around the
+    /// cursor does not reflect the shell line.
+    public var terminal: Bool
 
-    public init(op: Op, session: String, finalized: String? = nil, volatile: String? = nil, readBack: Bool = false) {
+    public init(op: Op, session: String, finalized: String? = nil, volatile: String? = nil,
+                readBack: Bool = false, terminal: Bool = false) {
         self.op = op
         self.session = session
         self.finalized = finalized
         self.volatile = volatile
         self.readBack = readBack
+        self.terminal = terminal
     }
 }
 

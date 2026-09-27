@@ -22,10 +22,18 @@ public struct MarkedTextComposer: Sendable {
     public private(set) var inserted = ""
     /// Text currently shown as marked.
     public private(set) var marked = ""
-    /// Last character this session committed (nil before the first word).
+    /// Last character before the caret: the field's existing text at session
+    /// start, then what this session committed. nil = nothing (no space).
     private var screenTail: Character?
 
-    public init() {}
+    /// - Parameter precedingCharacter: the character before the caret when
+    ///   dictation starts, so continuing after text gets a separating space.
+    public init(precedingCharacter: Character? = nil) {
+        screenTail = precedingCharacter
+    }
+
+    /// Last committed character (carried to the next session in this field).
+    public var lastCharacter: Character? { screenTail }
 
     /// Apply one update. `finalized` must extend what was already finalized
     /// (append-only); `volatile` is the full provisional tail after it.

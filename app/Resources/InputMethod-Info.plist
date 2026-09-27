@@ -39,6 +39,8 @@
 		<string>Grek</string>
 	</array>
 	<key>tsInputMethodIconFileKey</key>
-	<string>MenuIcon.pdf</string>
+	<string>MenuIcon.tiff</string>
+	<key>TISIconIsTemplate</key>
+	<true/>
 </dict>
 </plist>

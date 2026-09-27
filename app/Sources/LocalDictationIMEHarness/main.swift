@@ -1,5 +1,7 @@
 import AppKit
+import Carbon
 import Foundation
+import Network
 @testable import LocalDictation
 import LocalDictationIME
 
@@ -15,12 +17,65 @@ import LocalDictationIME
 // back through the input method and checks it equals
 // `prefix + finalized + volatile` exactly. Results: <out>/results.json.
 
+/// Browsers don't expose page text to input methods, so the test page posts
+/// its textarea value here on every change ("<page id>\n<value>").
+final class PageReporter: @unchecked Sendable {
+    static let port: UInt16 = 47654
+    private let lock = NSLock()
+    private var latest: [String: String] = [:]
+    private var listener: NWListener?
+
+    func start() throws {
+        let listener = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: Self.port)!)
+        listener.newConnectionHandler = { [weak self] connection in
+            connection.start(queue: .global())
+            self?.receive(connection, buffer: Data())
+        }
+        listener.start(queue: .global())
+        self.listener = listener
+    }
+
+    private func receive(_ connection: NWConnection, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [weak self] data, _, done, _ in
+            var buffer = buffer
+            if let data { buffer.append(data) }
+            if let self, let request = String(data: buffer, encoding: .utf8),
+               let split = request.range(of: "\r\n\r\n")
+            {
+                let headers = request[..<split.lowerBound].lowercased()
+                let body = String(request[split.upperBound...])
+                let length = headers.split(separator: "\r\n")
+                    .first { $0.hasPrefix("content-length:") }
+                    .flatMap { Int($0.dropFirst("content-length:".count).trimmingCharacters(in: .whitespaces)) } ?? 0
+                if body.utf8.count >= length {
+                    if let newline = body.firstIndex(of: "\n") {
+                        self.lock.withLock { self.latest[String(body[..<newline])] = String(body[body.index(after: newline)...]) }
+                    }
+                    let reply = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+                    connection.send(content: Data(reply.utf8), completion: .contentProcessed { _ in connection.cancel() })
+                    return
+                }
+            }
+            if done { connection.cancel(); return }
+            self?.receive(connection, buffer: buffer)
+        }
+    }
+
+    func value(for page: String) -> String? {
+        lock.withLock { latest[page] }
+    }
+}
+
 struct Target {
     let name: String
     let bundleID: String
     /// Text already in the field before dictation starts.
     let prefix: String
     let document: URL
+    /// Set for browser pages that report their own value.
+    var pageID: String? = nil
+    /// Set for terminals: a raw-mode `cat` writes what the shell receives here.
+    var terminalOutput: URL? = nil
 }
 
 struct StepFailure: Codable {
@@ -44,6 +99,11 @@ struct CaseResult: Codable {
 final class Harness {
     let out: URL
     var results: [CaseResult] = []
+    let reporter = PageReporter()
+    /// Text committed to each scratch document by earlier sessions.
+    var finals: [String: String] = [:]
+
+    func lastFinal(for target: Target) -> String { finals[target.document.path] ?? "" }
 
     init(out: URL) { self.out = out }
 
@@ -73,15 +133,29 @@ final class Harness {
                 targets.append(Target(name: name, bundleID: "com.apple.TextEdit", prefix: "", document: url))
             case "safari", "chrome":
                 let prefix = "Existing text stays: "
-                let url = dir.appendingPathComponent("\(name)-\(UUID().uuidString.prefix(6)).html")
+                let page = "\(name)-\(UUID().uuidString.prefix(6))"
+                let url = dir.appendingPathComponent("\(page).html")
                 let html = """
                 <!doctype html><meta charset="utf-8"><title>ld-ime</title>
                 <textarea id="t" autofocus style="width:90vw;height:60vh">\(prefix)</textarea>
-                <script>const t=document.getElementById('t');t.focus();t.setSelectionRange(t.value.length,t.value.length);</script>
+                <script>
+                const t=document.getElementById('t');t.focus();t.setSelectionRange(t.value.length,t.value.length);
+                let last=null;
+                setInterval(()=>{ if(t.value!==last){ last=t.value;
+                  fetch('http://127.0.0.1:\(PageReporter.port)/',{method:'POST',mode:'no-cors',body:'\(page)\\n'+t.value}).catch(()=>{}); } },30);
+                </script>
                 """
                 try html.write(to: url, atomically: true, encoding: .utf8)
                 let id = name == "safari" ? "com.apple.Safari" : "com.google.Chrome"
-                targets.append(Target(name: name, bundleID: id, prefix: prefix, document: url))
+                targets.append(Target(name: name, bundleID: id, prefix: prefix, document: url, pageID: page))
+            case "terminal", "warp":
+                let stem = "term-\(UUID().uuidString.prefix(6))"
+                let output = dir.appendingPathComponent("\(stem).out")
+                let script = dir.appendingPathComponent("\(stem).command")
+                try "#!/bin/zsh\nstty raw\nexec cat > '\(output.path)'\n".write(to: script, atomically: true, encoding: .utf8)
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+                let id = name == "terminal" ? "com.apple.Terminal" : "dev.warp.Warp-Stable"
+                targets.append(Target(name: name, bundleID: id, prefix: "", document: script, terminalOutput: output))
             default:
                 log("unknown app \(name)")
             }
@@ -111,12 +185,14 @@ final class Harness {
     func run(
         _ target: Target, name: String,
         updates: [(finalized: String, volatile: String)], final: String,
+        expectedBase: String = "",
         pace: Duration = .milliseconds(60)
     ) async {
+        let base = expectedBase.isEmpty ? "" : expectedBase + " "
         let started = Date()
         let inserter = InputMethodInserter(attachTimeout: .seconds(4))
         var failures: [StepFailure] = []
-        guard inserter.begin() else {
+        guard inserter.begin(terminal: target.terminalOutput != nil) else {
             failures.append(StepFailure(step: 0, expected: "", actual: nil, note: "begin failed: \(inserter.status)"))
             results.append(CaseResult(app: target.name, name: name, steps: 0, failures: failures,
                                       clientBundleID: nil, finalText: final, seconds: 0))
@@ -132,32 +208,61 @@ final class Harness {
             step += 1
             inserter.update(finalized: update.finalized, volatile: update.volatile)
             try? await Task.sleep(for: pace)
-            let reply = InputMethodPortClient.send(InputMethodRequest(op: .probe, session: "", readBack: true))
-            clientID = reply?.clientBundleID ?? clientID
-            let expected = target.prefix + Self.shown(update.finalized, update.volatile)
-            if reply?.documentText != expected {
-                failures.append(StepFailure(step: step, expected: expected, actual: reply?.documentText,
-                                            note: "marked=\(reply?.marked ?? "nil")"))
+            // Terminals show marked text themselves; the shell only receives committed text.
+            let expected = target.terminalOutput != nil
+                ? (update.finalized.isEmpty ? expectedBase : base + update.finalized)
+                : target.prefix + base + Self.shown(update.finalized, update.volatile)
+            let (actual, marked) = await readBack(target, expecting: expected)
+            if actual != expected {
+                failures.append(StepFailure(step: step, expected: expected, actual: actual, note: "marked=\(marked ?? "nil")"))
             }
+            if clientID == nil { clientID = inserter.lastReply?.clientBundleID }
         }
+        inserter.readBack = target.pageID == nil && target.terminalOutput == nil
         inserter.finish(finalText: final)
-        try? await Task.sleep(for: .milliseconds(400))
-        // The session ended and the source was restored: re-attach to read back.
-        let probe = InputMethodInserter(attachTimeout: .seconds(4))
-        _ = probe.begin()
-        for _ in 0..<200 where probe.status == .attaching {
-            try? await Task.sleep(for: .milliseconds(20))
+        let reply = inserter.lastReply
+        let expected = target.prefix + base + final
+        var finalText = reply?.documentText
+        if target.pageID != nil || target.terminalOutput != nil {
+            finalText = await readBack(target, expecting: expected).text
         }
-        let reply = InputMethodPortClient.send(InputMethodRequest(op: .probe, session: "", readBack: true))
-        probe.end(restoreDelay: .zero)
-        let expected = target.prefix + final
-        if reply?.documentText != expected {
-            failures.append(StepFailure(step: step + 1, expected: expected, actual: reply?.documentText, note: "after finish"))
+        if let output = target.terminalOutput {
+            // End the scratch window's `cat`.
+            let kill = Process()
+            kill.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+            kill.arguments = ["-f", "cat > \(output.path)"]
+            try? kill.run()
         }
+        if finalText != expected {
+            failures.append(StepFailure(step: step + 1, expected: expected, actual: finalText,
+                                        note: "after finish; error=\(reply?.error ?? "nil") attached=\(reply?.attached ?? false)"))
+        }
+        finals[target.document.path] = expectedBase.isEmpty ? final : expectedBase + " " + final
         let result = CaseResult(app: target.name, name: name, steps: updates.count + 1, failures: failures,
                                 clientBundleID: clientID, finalText: final, seconds: Date().timeIntervalSince(started))
         log("\(target.name)/\(name): steps=\(result.steps) failures=\(failures.count) client=\(clientID ?? "?")")
         results.append(result)
+    }
+
+    /// The field's text: the page's own report for browsers, the input
+    /// method's read-back otherwise. Waits briefly for the expected value.
+    func readBack(_ target: Target, expecting expected: String) async -> (text: String?, marked: String?) {
+        var text: String?
+        var marked: String?
+        for _ in 0..<20 {
+            if let page = target.pageID {
+                text = reporter.value(for: page)
+            } else if let output = target.terminalOutput {
+                text = (try? String(contentsOf: output, encoding: .utf8)) ?? ""
+            } else {
+                let reply = InputMethodPortClient.send(InputMethodRequest(op: .probe, session: "", readBack: true))
+                text = reply?.documentText
+                marked = reply?.marked
+            }
+            if text == expected { break }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return (text, marked)
     }
 
     /// What the field should show: finalized, a space, then the marked tail.
@@ -211,6 +316,90 @@ func transcribeUpdates(wav: URL, engine: ParakeetEngine) async throws -> (update
     return (updates, final)
 }
 
+/// Full app path: the real DictationController (CoreML provider, input
+/// method route) fed a WAV at real time as if from the microphone.
+@MainActor
+func runController(_ harness: Harness, target: Target, wav: URL, model: String) async {
+    let started = Date()
+    var config = AppConfig(provider: .parakeet, parakeetModelPath: model)
+    config.useInputMethod = true
+    let pcm = (try? Data(contentsOf: wav)).map { $0.subdata(in: 44..<$0.count) } ?? Data()
+    let feeder = AudioFeeder(pcm: pcm)
+    let deps = DictationController.Dependencies(
+        sleep: { try await Task.sleep(for: $0) },
+        isSecureEventInputEnabled: { false },
+        isAccessibilityTrusted: { true },
+        startAudio: { handler in feeder.start(handler) },
+        stopAudio: { feeder.stop() },
+        presentsSessionUI: false
+    )
+    let controller = DictationController(config: config, dependencies: deps)
+    var finalText: String?
+    controller.onFinalTranscript = { finalText = $0 }
+    controller.bootstrap()
+    for _ in 0..<600 where controller.state != .ready { try? await Task.sleep(for: .milliseconds(100)) }
+    guard await harness.open(target) else { return }
+    let before = TISCopyCurrentKeyboardInputSource().map { InputMethodInstaller.sourceID($0.takeRetainedValue()) ?? "?" } ?? "?"
+    controller.startDictation()
+    harness.log("controller: state=\(controller.state.statusTitle) source-before=\(before)")
+    while !feeder.finished { try? await Task.sleep(for: .milliseconds(100)) }
+    controller.stopDictation()
+    for _ in 0..<300 where finalText == nil { try? await Task.sleep(for: .milliseconds(100)) }
+    try? await Task.sleep(for: .milliseconds(600))
+    let after = TISCopyCurrentKeyboardInputSource().map { InputMethodInstaller.sourceID($0.takeRetainedValue()) ?? "?" } ?? "?"
+    var failures: [StepFailure] = []
+    let expected = target.prefix + (finalText ?? "<no final>")
+    var actual: String?
+    if target.pageID != nil || target.terminalOutput != nil {
+        actual = await harness.readBack(target, expecting: expected).text
+    } else {
+        let probe = InputMethodInserter(attachTimeout: .seconds(4))
+        _ = probe.begin()
+        for _ in 0..<200 where probe.status == .attaching { try? await Task.sleep(for: .milliseconds(20)) }
+        actual = await harness.readBack(target, expecting: expected).text
+        probe.end(restoreDelay: .zero)
+    }
+    if actual != expected {
+        failures.append(StepFailure(step: 1, expected: expected, actual: actual, note: "controller final"))
+    }
+    if after != before {
+        failures.append(StepFailure(step: 2, expected: before, actual: after, note: "input source not restored"))
+    }
+    harness.log("\(target.name)/controller: failures=\(failures.count) source-after=\(after) chars=\(finalText?.count ?? -1)")
+    harness.results.append(CaseResult(app: target.name, name: "controller-\(wav.deletingPathExtension().lastPathComponent)",
+                                      steps: 2, failures: failures, clientBundleID: target.bundleID,
+                                      finalText: finalText ?? "", seconds: Date().timeIntervalSince(started)))
+    controller.shutdown()
+}
+
+/// Feeds PCM16 in 100 ms chunks at real time on a background queue.
+final class AudioFeeder: @unchecked Sendable {
+    let pcm: Data
+    private let lock = NSLock()
+    private var running = false
+    private var done = false
+
+    init(pcm: Data) { self.pcm = pcm }
+
+    var finished: Bool { lock.withLock { done } }
+
+    func start(_ handler: @escaping @Sendable (Data) -> Void) {
+        lock.withLock { running = true; done = false }
+        DispatchQueue.global().async { [self] in
+            var offset = 0
+            while offset < pcm.count, lock.withLock({ running }) {
+                let end = min(offset + 3_200, pcm.count)
+                handler(pcm.subdata(in: offset..<end))
+                offset = end
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            lock.withLock { done = true }
+        }
+    }
+
+    func stop() { lock.withLock { running = false } }
+}
+
 let args = CommandLine.arguments
 func arg(_ name: String) -> String? {
     guard let i = args.firstIndex(of: name), i + 1 < args.count else { return nil }
@@ -223,6 +412,7 @@ NSApplication.shared.setActivationPolicy(.accessory)
 
 Task { @MainActor in
     let harness = Harness(out: out)
+    do { try harness.reporter.start() } catch { harness.log("page reporter failed: \(error)") }
     harness.log("harness start; IME installed at \(InputMethodInstaller.installedURL.path)")
     let registered = InputMethodInstaller.installAndRegister()
     harness.log("input source registered: \(registered != nil) enabled: \(InputMethodInstaller.isEnabled())")
@@ -249,6 +439,18 @@ Task { @MainActor in
     }
 
     let apps = (arg("--apps") ?? "textedit,safari,chrome").split(separator: ",").map(String.init)
+    if args.contains("--controller"), let wavs = arg("--wav"), let model = arg("--model") {
+        for app in apps {
+            for path in wavs.split(separator: ",") {
+                if let target = (try? harness.makeTargets([app]))?.first {
+                    await runController(harness, target: target, wav: URL(fileURLWithPath: String(path)), model: model)
+                }
+            }
+        }
+        harness.save()
+        harness.log("harness done: \(harness.results.filter { $0.failures.isEmpty }.count)/\(harness.results.count) cases clean")
+        exit(0)
+    }
     for target in (try? harness.makeTargets(apps)) ?? [] {
         guard await harness.open(target) else {
             harness.results.append(CaseResult(app: target.name, name: "open", steps: 0,
@@ -257,6 +459,16 @@ Task { @MainActor in
             continue
         }
         await harness.run(target, name: "scripted", updates: Harness.scripted, final: Harness.scriptedFinal)
+        // Back-to-back sessions: a new dictation right after the last one ended.
+        for gap in [50, 150, 300, 500, 700, 800] {
+            try? await Task.sleep(for: .milliseconds(gap))
+            let base = harness.lastFinal(for: target)
+            let words = "rapid \(gap)"
+            await harness.run(Target(name: target.name, bundleID: target.bundleID, prefix: target.prefix, document: target.document,
+                                     pageID: target.pageID, terminalOutput: target.terminalOutput),
+                              name: "rapid-\(gap)ms", updates: [("", words)], final: words,
+                              expectedBase: base, pace: .milliseconds(60))
+        }
         for item in live {
             // Fresh document per recording so each check starts from the prefix.
             if let fresh = (try? harness.makeTargets([target.name]))?.first, await harness.open(fresh) {
@@ -267,6 +479,7 @@ Task { @MainActor in
     }
     harness.save()
     harness.log("harness done: \(harness.results.filter { $0.failures.isEmpty }.count)/\(harness.results.count) cases clean")
+    try? await Task.sleep(for: .seconds(1))  // let the last input-source restore run
     exit(0)
 }
 NSApplication.shared.run()

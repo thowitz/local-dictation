@@ -125,6 +125,8 @@ final class DictationController {
     }
 
     var onStateChange: ((DictationState) -> Void)?
+    /// Observer for a session's final transcript (diagnostics / harness).
+    var onFinalTranscript: ((String) -> Void)?
 
     private let config: AppConfig
     private let deps: Dependencies
@@ -312,6 +314,10 @@ final class DictationController {
     }
 
     func bootstrap() {
+        if inputMethod != nil {
+            InputMethodInstaller.installAndRegister()
+            InputMethodInstaller.prelaunchIfEnabled()
+        }
         transition(to: .starting)
         supervisor.start()
     }
@@ -328,6 +334,8 @@ final class DictationController {
         audioGate.close()
         insertion?.cancel()
         insertion = nil
+        // Quitting must not leave the input method selected.
+        inputMethod?.restoreNow()
         endIndicatorSession(playSound: false)
         realtime.disconnect()
         supervisor.stop(reason: .applicationQuit)
@@ -772,6 +780,7 @@ final class DictationController {
             if let insertion {
                 // Final text only edits provisional text (marked, or the typist's draft tail).
                 insertion.finish(finalText: transcript)
+                onFinalTranscript?(transcript)
                 if insertion.realignCount > 0 {
                     AppLog.general.info(
                         "session needed \(insertion.realignCount, privacy: .public) bounded-revision fallback(s)"

@@ -25,13 +25,23 @@ final class InputMethodInserter {
     private(set) var status: Status = .idle
     /// The input method attached this session (text may be on screen).
     private(set) var didAttach = false
+    /// Ask the input method to return the field's text with every reply
+    /// (verification harness / diagnostics).
+    var readBack = false
+    /// Latest reply from the input method.
+    private(set) var lastReply: InputMethodReply?
     /// Called once per session if the input method cannot be used.
     var onUnavailable: ((String) -> Void)?
 
     private var previousSource: TISInputSource?
+    /// A delayed restore from the previous session, cancelled if a new one starts.
+    private var pendingRestore: (task: Task<Void, Never>, source: TISInputSource)?
     private var session = ""
     private var pending: InputMethodRequest?
     private var attachTask: Task<Void, Never>?
+    private var selectedSource: TISInputSource?
+    /// The focused app is a terminal (see `InputMethodRequest.terminal`).
+    private var terminal = false
     private let attachTimeout: Duration
 
     init(attachTimeout: Duration = .seconds(1.5)) {
@@ -40,18 +50,18 @@ final class InputMethodInserter {
 
     /// Switch to the input method for this session. Returns false when it is
     /// not installed or cannot be selected (use keystrokes instead).
-    func begin() -> Bool {
+    func begin(terminal: Bool = false) -> Bool {
         end(restoreDelay: .zero)
+        self.terminal = terminal
         // Only an input source the user already approved: enabling one
         // triggers macOS's approval UI, which belongs in the Setup Checklist.
         guard let source = InputMethodInstaller.enabledSource() else {
             status = .failed("input method not enabled")
             return false
         }
-        let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue()
-        if let current, InputMethodInstaller.sourceID(current) != InputMethodIdentity.inputSourceID {
-            previousSource = current
-        }
+        previousSource = Self.sourceToRestore(pending: pendingRestore?.source)
+        pendingRestore?.task.cancel()
+        pendingRestore = nil
         guard TISSelectInputSource(source) == noErr else {
             status = .failed("could not select input method")
             return false
@@ -60,6 +70,7 @@ final class InputMethodInserter {
         status = .attaching
         didAttach = false
         pending = nil
+        selectedSource = source
         attachTask = Task { [weak self] in await self?.waitForAttach() }
         return true
     }
@@ -100,20 +111,48 @@ final class InputMethodInserter {
             TISSelectInputSource(previous)
         } else {
             // Let the client process the last insert before the IME detaches.
-            Task { @MainActor in
+            let task = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: restoreDelay)
+                guard !Task.isCancelled else { return }
                 TISSelectInputSource(previous)
+                self?.pendingRestore = nil
             }
+            pendingRestore = (task, previous)
         }
+    }
+
+    /// Apply a pending delayed restore right away (app quitting).
+    func restoreNow() {
+        guard let pending = pendingRestore else { return }
+        pending.task.cancel()
+        pendingRestore = nil
+        TISSelectInputSource(pending.source)
+    }
+
+    /// What to switch back to after the session: the user's current source,
+    /// or — if ours is already selected (a restore still pending, or left
+    /// over from a crash) — the pending target or their ASCII keyboard layout.
+    private static func sourceToRestore(pending: TISInputSource?) -> TISInputSource? {
+        if let pending { return pending }
+        if let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+           InputMethodInstaller.sourceID(current) != InputMethodIdentity.inputSourceID
+        {
+            return current
+        }
+        return TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue()
     }
 
     // MARK: - Internals
 
     @discardableResult
     private func send(_ request: InputMethodRequest) -> Bool {
+        var request = request
+        request.readBack = readBack
         switch status {
         case .attached:
-            guard let reply = InputMethodPortClient.send(request), reply.ok else {
+            let reply = InputMethodPortClient.send(request)
+            lastReply = reply ?? lastReply
+            guard let reply, reply.ok else {
                 AppLog.insertion.error("input method request \(request.op.rawValue, privacy: .public) failed")
                 return false
             }
@@ -135,12 +174,29 @@ final class InputMethodInserter {
     private func waitForAttach() async {
         let clock = ContinuousClock()
         let deadline = clock.now + attachTimeout
+        var nextReselect = clock.now + .milliseconds(300)
         while !Task.isCancelled, clock.now < deadline {
             if tryBegin() { return }
+            if clock.now >= nextReselect {
+                // Clients apply source changes asynchronously: a restore from
+                // the previous session can land after our selection and leave
+                // the input method selected but detached. Switch away and back.
+                reselect()
+                nextReselect = clock.now + .milliseconds(400)
+            }
             try? await Task.sleep(for: .milliseconds(30))
         }
         guard !Task.isCancelled, status == .attaching else { return }
         fail("input method did not attach to the focused field")
+    }
+
+    private func reselect() {
+        guard let ours = selectedSource,
+              let away = previousSource ?? TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue()
+        else { return }
+        AppLog.insertion.info("input method not attached yet; re-selecting")
+        TISSelectInputSource(away)
+        TISSelectInputSource(ours)
     }
 
     /// Synchronous variant used when the session ends while still attaching.
@@ -156,7 +212,7 @@ final class InputMethodInserter {
 
     private func tryBegin() -> Bool {
         guard let reply = InputMethodPortClient.send(
-            InputMethodRequest(op: .begin, session: session), timeout: 0.2
+            InputMethodRequest(op: .begin, session: session, terminal: terminal), timeout: 0.2
         ), reply.ok, reply.attached else { return false }
         status = .attached
         didAttach = true
@@ -264,6 +320,27 @@ enum InputMethodInstaller {
               let db = FileManager.default.contents(atPath: b.appendingPathComponent(exe).path)
         else { return false }
         return da == db
+    }
+
+    /// Start the input method's process ahead of the first dictation. The
+    /// first launch after an install or update takes seconds (the system
+    /// assesses the new binary) — longer than a dictation should wait before
+    /// falling back to keystrokes. A background-only input method cannot be
+    /// opened directly, so select it briefly: macOS launches it, and it keeps
+    /// running after the previous source is restored.
+    @MainActor
+    static func prelaunchIfEnabled() {
+        guard let source = enabledSource(),
+              NSRunningApplication.runningApplications(withBundleIdentifier: InputMethodIdentity.bundleIdentifier).isEmpty,
+              let previous = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+              sourceID(previous) != InputMethodIdentity.inputSourceID
+        else { return }
+        guard TISSelectInputSource(source) == noErr else { return }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(300))
+            TISSelectInputSource(previous)
+            AppLog.insertion.info("input method warmed up")
+        }
     }
 
     private static func terminateRunningInputMethod() {

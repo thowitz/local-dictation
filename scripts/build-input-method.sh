@@ -39,7 +39,7 @@ bundle() { # name executable plist
 mkdir -p "$OUT"
 BIN="$(build LocalDictationInputMethod)"
 bundle LocalDictationInput.app "$BIN/LocalDictationInputMethod" "$APP_DIR/Resources/InputMethod-Info.plist"
-cp "$APP_DIR/Resources/InputMethodIcon.pdf" "$OUT/LocalDictationInput.app/Contents/Resources/MenuIcon.pdf"
+cp "$APP_DIR/Resources/InputMethodIcon.tiff" "$OUT/LocalDictationInput.app/Contents/Resources/MenuIcon.tiff"
 codesign --force --sign "$SIGN_ID" "$OUT/LocalDictationInput.app"
 echo "$OUT/LocalDictationInput.app"
 

@@ -32,7 +32,7 @@ final class InsertionSession {
     var realignCount: Int { typist.realignCount }
 
     func begin() {
-        guard let inputMethod, inputMethod.begin() else { return }
+        guard let inputMethod, inputMethod.begin(terminal: textInserter.stripLineBreaks) else { return }
         route = .inputMethod
         inputMethod.onUnavailable = { [weak self] _ in self?.fallBackToKeystrokes() }
     }

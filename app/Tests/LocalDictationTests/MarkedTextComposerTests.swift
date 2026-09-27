@@ -142,6 +142,21 @@ struct MarkedTextComposerTests {
         #expect(field.string == "Hello there. Again")
     }
 
+    @Test("Continuing after existing text adds one separating space")
+    func continuesWithSpace() {
+        let field = FakeTextField("Earlier sentence.")
+        var composer = MarkedTextComposer(precedingCharacter: ".")
+        composer.update(finalized: "", volatile: "Next one", client: field)
+        #expect(field.string == "Earlier sentence. Next one")
+        composer.finish(finalText: "Next one.", client: field)
+        #expect(field.string == "Earlier sentence. Next one.")
+
+        let spaced = FakeTextField("Ends with space ")
+        var second = MarkedTextComposer(precedingCharacter: " ")
+        second.finish(finalText: "no double", client: spaced)
+        #expect(spaced.string == "Ends with space no double")
+    }
+
     @Test("Unchanged updates make no client calls")
     func idempotent() {
         let field = FakeTextField()

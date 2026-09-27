@@ -5,6 +5,21 @@ import os
 
 let log = Logger(subsystem: InputMethodIdentity.bundleIdentifier, category: "ime")
 
+/// Timestamped trace to /tmp/ld-ime-debug.log while /tmp/ld-ime-debug.flag
+/// exists (diagnostics only; off by default).
+func trace(_ message: @autoclosure () -> String) {
+    guard FileManager.default.fileExists(atPath: "/tmp/ld-ime-debug.flag") else { return }
+    let line = "\(Date().timeIntervalSince1970) \(message())\n"
+    let url = URL(fileURLWithPath: "/tmp/ld-ime-debug.log")
+    if let handle = try? FileHandle(forWritingTo: url) {
+        handle.seekToEndOfFile()
+        handle.write(Data(line.utf8))
+        try? handle.close()
+    } else {
+        try? Data(line.utf8).write(to: url)
+    }
+}
+
 /// One controller per client text field (created by InputMethodKit). It never
 /// consumes keystrokes; it only tells the bridge which field is focused.
 @objc(LocalDictationInputController)
@@ -57,6 +72,22 @@ final class IMKClientAdapter: MarkedTextClient {
 
     var bundleID: String? { client.bundleIdentifier() }
 
+    /// The character just before the caret/selection, when the client says.
+    func precedingCharacter() -> Character?? {
+        let selection = client.selectedRange()
+        guard selection.location != NSNotFound else { return .none }
+        if selection.location == 0 {
+            // Start of a field with text, or a client that exposes no text at
+            // all (terminals report an empty document): only the former is known.
+            let length = client.length()
+            return length != NSNotFound && length > 0 ? .some(nil) : .none
+        }
+        guard let text = client.attributedSubstring(from: NSRange(location: selection.location - 1, length: 1))?.string,
+              let last = text.last
+        else { return .none }
+        return .some(last)
+    }
+
     /// Full text of the field, when the client exposes it.
     func documentText() -> String? {
         let length = client.length()
@@ -75,6 +106,10 @@ final class InputMethodBridge {
     private var client: IMKClientAdapter?
     private var session: String?
     private var composer = MarkedTextComposer()
+    /// Where the previous session ended, for clients whose text is hidden or
+    /// unreliable (terminals). Keyed by app: controllers are recreated when
+    /// the input source is re-selected.
+    private var lastSession: (bundleID: String?, tail: Character?, ended: Date)?
 
     func start() {
         // The port's run-loop source is on the main run loop.
@@ -93,9 +128,11 @@ final class InputMethodBridge {
         self.controller = controller
         client = IMKClientAdapter(sender)
         log.info("attached client \(self.client?.bundleID ?? "?", privacy: .public)")
+        trace("attach \(ObjectIdentifier(controller).hashValue) client=\(self.client?.bundleID ?? "?")")
     }
 
     func detach(_ controller: LocalDictationInputController) {
+        trace("detach \(ObjectIdentifier(controller).hashValue) current=\(self.controller === controller)")
         guard self.controller === controller else { return }
         if let client { composer.commitMarked(client: client) }
         self.controller = nil
@@ -109,13 +146,28 @@ final class InputMethodBridge {
     }
 
     private func handle(_ request: InputMethodRequest) -> InputMethodReply {
+        let started = Date()
+        defer { trace("\(request.op.rawValue) readBack=\(request.readBack) \(Int(Date().timeIntervalSince(started) * 1000))ms") }
         guard let client else {
             return InputMethodReply(ok: false, error: "no focused text field", attached: false)
         }
         switch request.op {
         case .begin:
             session = request.session
-            composer = MarkedTextComposer()
+            // Continue after existing text with a space, like system dictation.
+            var preceding: Character?
+            switch request.terminal ? .none : client.precedingCharacter() {
+            case .some(let known):
+                preceding = known
+            case .none:
+                if let last = lastSession, last.bundleID == client.bundleID,
+                   Date().timeIntervalSince(last.ended) < 30
+                {
+                    preceding = last.tail
+                }
+            }
+            composer = MarkedTextComposer(precedingCharacter: preceding)
+            trace("begin preceding=\(preceding.map { String($0) } ?? "nil")")
         case .probe:
             break
         default:
@@ -127,10 +179,10 @@ final class InputMethodBridge {
                 composer.update(finalized: request.finalized ?? "", volatile: request.volatile ?? "", client: client)
             case .finish:
                 composer.finish(finalText: request.finalized ?? composer.inserted, client: client)
-                session = nil
+                rememberSession()
             case .cancel:
                 composer.commitMarked(client: client)
-                session = nil
+                rememberSession()
             case .newSegment:
                 composer.startNewSegment(client: client)
             case .begin, .probe:
@@ -138,6 +190,11 @@ final class InputMethodBridge {
             }
         }
         return reply(ok: true, error: nil, client: client, readBack: request.readBack)
+    }
+
+    private func rememberSession() {
+        session = nil
+        lastSession = (client?.bundleID, composer.lastCharacter, Date())
     }
 
     private func reply(ok: Bool, error: String?, client: IMKClientAdapter, readBack: Bool) -> InputMethodReply {
