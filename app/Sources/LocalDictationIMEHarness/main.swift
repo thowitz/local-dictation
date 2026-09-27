@@ -319,10 +319,8 @@ func transcribeUpdates(wav: URL, engine: ParakeetEngine) async throws -> (update
 /// Full app path: the real DictationController (CoreML provider, input
 /// method route) fed a WAV at real time as if from the microphone.
 @MainActor
-func runController(_ harness: Harness, target: Target, wav: URL, model: String) async {
+func runController(_ harness: Harness, target: Target, wav: URL, config: AppConfig) async {
     let started = Date()
-    var config = AppConfig(provider: .parakeet, parakeetModelPath: model)
-    config.useInputMethod = true
     let pcm = (try? Data(contentsOf: wav)).map { $0.subdata(in: 44..<$0.count) } ?? Data()
     let feeder = AudioFeeder(pcm: pcm)
     let deps = DictationController.Dependencies(
@@ -337,7 +335,8 @@ func runController(_ harness: Harness, target: Target, wav: URL, model: String) 
     var finalText: String?
     controller.onFinalTranscript = { finalText = $0 }
     controller.bootstrap()
-    for _ in 0..<600 where controller.state != .ready { try? await Task.sleep(for: .milliseconds(100)) }
+    for _ in 0..<1200 where controller.state != .ready { try? await Task.sleep(for: .milliseconds(100)) }
+    harness.log("controller ready: \(controller.state.statusTitle) provider=\(config.provider.rawValue)")
     guard await harness.open(target) else { return }
     let before = TISCopyCurrentKeyboardInputSource().map { InputMethodInstaller.sourceID($0.takeRetainedValue()) ?? "?" } ?? "?"
     controller.startDictation()
@@ -439,11 +438,25 @@ Task { @MainActor in
     }
 
     let apps = (arg("--apps") ?? "textedit,safari,chrome").split(separator: ",").map(String.init)
-    if args.contains("--controller"), let wavs = arg("--wav"), let model = arg("--model") {
+    if args.contains("--controller"), let wavs = arg("--wav") {
+        // --model <coreml dir>  or  --mlx-model <dir> --server <executable> [--port N]
+        var config: AppConfig
+        if let mlx = arg("--mlx-model") {
+            config = AppConfig(
+                serverExecutable: arg("--server"),
+                port: Int(arg("--port") ?? "8472") ?? 8472,
+                provider: .parakeetMlx,
+                parakeetMlxModelPath: mlx,
+                idleUnloadMinutes: 0
+            )
+        } else {
+            config = AppConfig(provider: .parakeet, parakeetModelPath: arg("--model"))
+        }
+        config.useInputMethod = true
         for app in apps {
             for path in wavs.split(separator: ",") {
                 if let target = (try? harness.makeTargets([app]))?.first {
-                    await runController(harness, target: target, wav: URL(fileURLWithPath: String(path)), model: model)
+                    await runController(harness, target: target, wav: URL(fileURLWithPath: String(path)), config: config)
                 }
             }
         }

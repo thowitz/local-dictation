@@ -108,7 +108,8 @@ mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$CONTENTS/Helpers"
 # --- 3: build and copy Swift release binary ---------------------------------
 
 log "Building Swift release executable"
-(cd "$APP_DIR" && swift build -c release)
+# Only the app: the dev-only harness uses @testable import (debug builds only).
+(cd "$APP_DIR" && swift build -c release --product LocalDictation)
 BIN_PATH="$(cd "$APP_DIR" && swift build -c release --show-bin-path)"
 [[ -x "$BIN_PATH/LocalDictation" ]] || die "swift build did not produce $BIN_PATH/LocalDictation"
 cp "$BIN_PATH/LocalDictation" "$CONTENTS/MacOS/LocalDictation"

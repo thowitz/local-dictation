@@ -23,8 +23,8 @@ done
 SIGN_ID="${CODESIGN_IDENTITY:--}"
 
 build() {
-  (cd "$APP_DIR" && swift build -c "$CONFIG" "${SCRATCH[@]}" --product "$1" >&2)
-  (cd "$APP_DIR" && swift build -c "$CONFIG" "${SCRATCH[@]}" --show-bin-path)
+  (cd "$APP_DIR" && swift build -c "$CONFIG" ${SCRATCH[@]+"${SCRATCH[@]}"} --product "$1" >&2)
+  (cd "$APP_DIR" && swift build -c "$CONFIG" ${SCRATCH[@]+"${SCRATCH[@]}"} --show-bin-path)
 }
 
 bundle() { # name executable plist
