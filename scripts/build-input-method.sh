@@ -59,6 +59,9 @@ if [[ $HARNESS == 1 ]]; then
 PLIST
   bundle LocalDictationIMEHarness.app "$BIN/LocalDictationIMEHarness" "$PLIST"
   rm -f "$PLIST"
+  # Like the app: the harness installs the input method it embeds.
+  mkdir -p "$OUT/LocalDictationIMEHarness.app/Contents/Helpers"
+  ditto "$OUT/LocalDictationInput.app" "$OUT/LocalDictationIMEHarness.app/Contents/Helpers/LocalDictationInput.app"
   codesign --force --sign "$SIGN_ID" "$OUT/LocalDictationIMEHarness.app"
   echo "$OUT/LocalDictationIMEHarness.app"
 fi

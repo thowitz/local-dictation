@@ -128,7 +128,7 @@ final class DictationController {
     /// Observer for a session's final transcript (diagnostics / harness).
     var onFinalTranscript: ((String) -> Void)?
 
-    private let config: AppConfig
+    private var config: AppConfig
     private let deps: Dependencies
     private let supervisor: any SpeechRuntime
     private let realtime: any DictationRealtimeClient
@@ -148,8 +148,7 @@ final class DictationController {
     /// Single owner of what this session puts into the focused app.
     private var insertion: InsertionSession?
     /// Marked-text insertion via the bundled input method (nil: keystrokes only).
-    private lazy var inputMethod: InputMethodInserter? =
-        config.useInputMethod && deps.typeEdit == nil ? InputMethodInserter() : nil
+    private lazy var inputMethod: InputMethodInserter? = makeInputMethod()
     private let audioGate = AudioGate()
     /// Realtime callbacks arrive on arbitrary threads; one FIFO stream drained
     /// on the main actor keeps transcript, done, and connection events in order.
@@ -314,12 +313,52 @@ final class DictationController {
     }
 
     func bootstrap() {
-        if inputMethod != nil {
-            InputMethodInstaller.installAndRegister()
-            InputMethodInstaller.prelaunchIfEnabled()
-        }
+        InputSourceBadge.recoverAfterCrash()
+        setUpInputMethod()
         transition(to: .starting)
         supervisor.start()
+    }
+
+    var insertionMethod: InsertionMethod { config.insertionMethod }
+    var hidesInputSourceBadge: Bool { config.hideInputSourceBadge }
+
+    /// Menu: switch insertion method / badge hiding without restarting the
+    /// speech runtime. A session in progress keeps its inserter.
+    func applyInsertionSettings(method: InsertionMethod, hideBadge: Bool) {
+        guard method != config.insertionMethod || hideBadge != config.hideInputSourceBadge else { return }
+        if method != config.insertionMethod {
+            inputMethod?.deactivate()
+        } else {
+            inputMethod?.restoreNow()
+        }
+        config.insertionMethod = method
+        config.hideInputSourceBadge = hideBadge
+        inputMethod = makeInputMethod()
+        setUpInputMethod()
+        AppLog.insertion.info(
+            "insertion method \(method.rawValue, privacy: .public) hideBadge=\(hideBadge, privacy: .public)"
+        )
+    }
+
+    private func makeInputMethod() -> InputMethodInserter? {
+        guard deps.typeEdit == nil, config.insertionMethod != .keystrokes else { return nil }
+        return InputMethodInserter(method: config.insertionMethod, hideBadge: config.hideInputSourceBadge)
+    }
+
+    private func setUpInputMethod() {
+        guard let inputMethod else { return }
+        let result = inputMethod.installer.setUp()
+        AppLog.insertion.info("input method setup: \(String(describing: result), privacy: .public)")
+        inputMethod.activate()
+    }
+
+    /// Where the caret mic goes: the input method's caret (reported by the
+    /// field itself), else Accessibility's. Never the mouse pointer.
+    private func indicatorAnchor() -> CaretAnchor? {
+        if insertion?.route == .inputMethod, let rect = inputMethod?.caretRect() {
+            return CaretAnchor(rect: rect, level: .caret)
+        }
+        return CaretLocator.textAnchor()
     }
 
     /// Idempotent teardown for Quit / `applicationWillTerminate`.
@@ -628,7 +667,7 @@ final class DictationController {
 
     private func showIndicatorListening() {
         sounds.playStart()
-        indicator.show(at: CaretLocator.caretAnchor())
+        indicator.show(following: { [weak self] in self?.indicatorAnchor() })
         indicatorActive = true
     }
 
@@ -866,6 +905,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var holdToTalkModeItem: NSMenuItem!
     private var pressToToggleModeItem: NSMenuItem!
     private var speechProviderItem: NSMenuItem!
+    private var insertionMethodItem: NSMenuItem!
+    private var insertionMethodItems: [InsertionMethod: NSMenuItem] = [:]
+    private var hideBadgeItem: NSMenuItem!
     private var voxtralProviderItem: NSMenuItem!
     private var parakeetProviderItem: NSMenuItem!
     private var parakeetMlxProviderItem: NSMenuItem!
@@ -1116,6 +1158,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         speechProviderItem.submenu = speechProviderMenu
         menu.addItem(speechProviderItem)
 
+        let insertionMenu = NSMenu()
+        for method in InsertionMethod.allCases {
+            let item = NSMenuItem(
+                title: method.displayName,
+                action: #selector(selectInsertionMethod(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = method.rawValue
+            item.toolTip = method.menuHelp
+            insertionMenu.addItem(item)
+            insertionMethodItems[method] = item
+        }
+        insertionMenu.addItem(.separator())
+        hideBadgeItem = NSMenuItem(
+            title: "Hide Input Source Badge While Switching",
+            action: #selector(toggleHideBadge),
+            keyEquivalent: ""
+        )
+        hideBadgeItem.target = self
+        hideBadgeItem.toolTip =
+            "Turns off the caret badge (e.g. \"A\") for a moment around each switch to and from the input method."
+        insertionMenu.addItem(hideBadgeItem)
+        insertionMethodItem = NSMenuItem(title: "Insertion Method", action: nil, keyEquivalent: "")
+        insertionMethodItem.submenu = insertionMenu
+        menu.addItem(insertionMethodItem)
+
         menu.addItem(.separator())
 
         micPermissionItem = NSMenuItem(
@@ -1155,6 +1224,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshPlaySoundsItem()
         refreshMicKeyModeItems()
         refreshSpeechProviderItems()
+        refreshInsertionItems()
         refreshRemapItems()
         refreshUI(for: .idle)
 
@@ -1223,6 +1293,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func selectPressToToggleMode() {
         MicKeyMode.write(.toggle, to: AppIdentity.defaults)
         refreshMicKeyModeItems()
+    }
+
+    @objc private func selectInsertionMethod(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let method = InsertionMethod(rawValue: raw)
+        else { return }
+        applyInsertion(method: method, hideBadge: config.hideInputSourceBadge)
+    }
+
+    @objc private func toggleHideBadge() {
+        applyInsertion(method: config.insertionMethod, hideBadge: !config.hideInputSourceBadge)
+    }
+
+    private func applyInsertion(method: InsertionMethod, hideBadge: Bool) {
+        config.insertionMethod = method
+        config.hideInputSourceBadge = hideBadge
+        config.save()
+        controller.applyInsertionSettings(method: method, hideBadge: hideBadge)
+        refreshInsertionItems()
+        if method.usesInputMethod, !InputMethodInstaller().isEnabled() {
+            // Needs a one-time step in Input Sources.
+            showSetupChecklist()
+        }
+    }
+
+    private func refreshInsertionItems() {
+        for (method, item) in insertionMethodItems {
+            item.state = method == config.insertionMethod ? .on : .off
+        }
+        hideBadgeItem.state = config.hideInputSourceBadge ? .on : .off
+        hideBadgeItem.isEnabled = config.insertionMethod.usesInputMethod
+        insertionMethodItem.title = "Insertion Method: \(config.insertionMethod.displayName)"
     }
 
     @objc private func selectVoxtralProvider() {

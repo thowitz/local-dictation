@@ -1,4 +1,5 @@
 import AppKit
+import Carbon
 import InputMethodKit
 import LocalDictationIME
 import os
@@ -25,8 +26,12 @@ func trace(_ message: @autoclosure () -> String) {
 @objc(LocalDictationInputController)
 final class LocalDictationInputController: IMKInputController {
     // InputMethodKit calls controllers on the main thread.
+    /// Keys pass through with the user's own layout (see `overrideLayout`).
+    private var overrodeLayout = false
+
     override func activateServer(_ sender: Any!) {
         super.activateServer(sender)
+        overrideLayout(sender)
         nonisolated(unsafe) let (controller, sender) = (self, sender)
         MainActor.assumeIsolated { InputMethodBridge.shared.attach(controller, client: sender) }
     }
@@ -44,8 +49,28 @@ final class LocalDictationInputController: IMKInputController {
         MainActor.assumeIsolated { InputMethodBridge.shared.commitComposition(for: controller, client: sender) }
     }
 
+    /// Chromium and Electron clients only activate an input method that
+    /// asks for key events (Squirrel does the same).
+    override func recognizedEvents(_ sender: Any!) -> Int {
+        Int(NSEvent.EventTypeMask.keyDown.rawValue | NSEvent.EventTypeMask.flagsChanged.rawValue)
+    }
+
     override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
-        false  // typing passes straight through to the app
+        if !overrodeLayout { overrideLayout(sender) }
+        return false  // typing passes straight through to the app
+    }
+
+    /// A keyboard input method has no layout of its own: keys it does not
+    /// consume are interpreted with this one — the user's current ASCII
+    /// layout (e.g. British), so typing is unchanged while we are selected.
+    private func overrideLayout(_ sender: Any?) {
+        guard let client = sender as? (any IMKTextInput),
+              let layout = TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue(),
+              let raw = TISGetInputSourceProperty(layout, kTISPropertyInputSourceID)
+        else { return }
+        let id = Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
+        client.overrideKeyboard(withKeyboardNamed: id)
+        overrodeLayout = true
     }
 }
 
@@ -86,6 +111,15 @@ final class IMKClientAdapter: MarkedTextClient {
               let last = text.last
         else { return .none }
         return .some(last)
+    }
+
+    /// The caret after `offset` characters of marked text, in AppKit screen
+    /// coordinates, when the client reports one.
+    func caretRect(markedLength offset: Int) -> [Double]? {
+        var line = NSRect.zero
+        _ = client.attributes(forCharacterIndex: offset, lineHeightRectangle: &line)
+        guard line.height > 0, line.origin != .zero else { return nil }
+        return [line.origin.x, line.origin.y, max(line.width, 1), line.height]
     }
 
     /// Full text of the field, when the client exposes it.
@@ -200,7 +234,8 @@ final class InputMethodBridge {
     private func reply(ok: Bool, error: String?, client: IMKClientAdapter, readBack: Bool) -> InputMethodReply {
         InputMethodReply(
             ok: ok, error: error, attached: true, clientBundleID: client.bundleID,
-            marked: composer.marked, documentText: readBack ? client.documentText() : nil
+            marked: composer.marked, documentText: readBack ? client.documentText() : nil,
+            caret: client.caretRect(markedLength: (composer.marked as NSString).length)
         )
     }
 }

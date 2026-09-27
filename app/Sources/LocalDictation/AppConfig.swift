@@ -35,9 +35,12 @@ struct AppConfig: Codable, Sendable {
     /// `0` disables unload; omitted/negative values resolve to `defaultIdleUnloadMinutes`.
     var idleUnloadMinutes: Double
 
-    /// Insert through the Local Dictation input method (marked text, like
-    /// system dictation). `false` types synthetic keystrokes instead.
-    var useInputMethod: Bool
+    /// How dictated text gets into the focused app (menu: Insertion Method).
+    var insertionMethod: InsertionMethod
+
+    /// Turn off macOS's input-source badge beside the caret (e.g. "A") while
+    /// switching to and from the input method (back on right after).
+    var hideInputSourceBadge: Bool
 
     static let defaultPort = 8471
     static let defaultIdleUnloadMinutes: Double = 10
@@ -57,6 +60,9 @@ struct AppConfig: Codable, Sendable {
         case parakeetMlxModelPath
         case parakeetChunkSeconds
         case idleUnloadMinutes
+        case insertionMethod
+        case hideInputSourceBadge
+        /// Legacy (≤ 0.2): `false` meant keystrokes.
         case useInputMethod
     }
 
@@ -92,7 +98,8 @@ struct AppConfig: Codable, Sendable {
         parakeetMlxModelPath: String? = nil,
         parakeetChunkSeconds: Double = defaultParakeetChunkSeconds,
         idleUnloadMinutes: Double = defaultIdleUnloadMinutes,
-        useInputMethod: Bool = true
+        insertionMethod: InsertionMethod = .default,
+        hideInputSourceBadge: Bool = true
     ) {
         self.serverExecutable = serverExecutable
         self.port = port
@@ -102,7 +109,8 @@ struct AppConfig: Codable, Sendable {
         self.parakeetMlxModelPath = parakeetMlxModelPath
         self.parakeetChunkSeconds = Self.normalizedChunkSeconds(parakeetChunkSeconds)
         self.idleUnloadMinutes = Self.normalizedIdleUnloadMinutes(idleUnloadMinutes)
-        self.useInputMethod = useInputMethod
+        self.insertionMethod = insertionMethod
+        self.hideInputSourceBadge = hideInputSourceBadge
     }
 
     init(from decoder: Decoder) throws {
@@ -126,7 +134,14 @@ struct AppConfig: Codable, Sendable {
         )
         let rawIdle = try container.decodeIfPresent(Double.self, forKey: .idleUnloadMinutes)
         idleUnloadMinutes = Self.normalizedIdleUnloadMinutes(rawIdle ?? Self.defaultIdleUnloadMinutes)
-        useInputMethod = try container.decodeIfPresent(Bool.self, forKey: .useInputMethod) ?? true
+        if let raw = try container.decodeIfPresent(String.self, forKey: .insertionMethod) {
+            insertionMethod = InsertionMethod(rawValue: raw) ?? .default
+        } else if let legacy = try container.decodeIfPresent(Bool.self, forKey: .useInputMethod) {
+            insertionMethod = legacy ? .switchPerDictation : .keystrokes
+        } else {
+            insertionMethod = .default
+        }
+        hideInputSourceBadge = try container.decodeIfPresent(Bool.self, forKey: .hideInputSourceBadge) ?? true
     }
 
     func encode(to encoder: Encoder) throws {
@@ -139,7 +154,8 @@ struct AppConfig: Codable, Sendable {
         try container.encodeIfPresent(parakeetMlxModelPath, forKey: .parakeetMlxModelPath)
         try container.encode(parakeetChunkSeconds, forKey: .parakeetChunkSeconds)
         try container.encode(idleUnloadMinutes, forKey: .idleUnloadMinutes)
-        try container.encode(useInputMethod, forKey: .useInputMethod)
+        try container.encode(insertionMethod.rawValue, forKey: .insertionMethod)
+        try container.encode(hideInputSourceBadge, forKey: .hideInputSourceBadge)
     }
 
     /// Effective idle timeout, or `nil` when unload is disabled (`idleUnloadMinutes == 0`).
@@ -298,4 +314,42 @@ struct AppConfig: Codable, Sendable {
     var websocketURL: URL {
         URL(string: "ws://127.0.0.1:\(port)/v1/realtime")!
     }
+}
+
+/// How dictated text gets into the focused app.
+enum InsertionMethod: String, CaseIterable, Codable, Sendable {
+    /// Synthetic keystrokes: committed words are typed, the draft tail is
+    /// retyped when it changes. No input method involved.
+    case keystrokes
+    /// Keyboard input method selected while the mic key is held, then the
+    /// previous source is restored.
+    case switchPerDictation = "switch-per-dictation"
+    /// Keyboard input method kept selected; keys pass through with the
+    /// user's layout, so nothing switches when dictation starts.
+    case alwaysSelected = "always-selected"
+
+    static let `default`: InsertionMethod = .keystrokes
+
+    var displayName: String {
+        switch self {
+        case .keystrokes: return "Live Keystrokes"
+        case .switchPerDictation: return "Input Method While Dictating"
+        case .alwaysSelected: return "Input Method Always Selected"
+        }
+    }
+
+    var menuHelp: String {
+        switch self {
+        case .keystrokes:
+            return "Types words as they are recognised; corrections are retyped. Works everywhere."
+        case .switchPerDictation:
+            return "Underlined live text in every app. Switches to the Local Dictation input source while the key is held."
+        case .alwaysSelected:
+            return "Underlined live text in every app, no switching. Local Dictation stays your input source "
+                + "and passes typing through with your layout."
+        }
+    }
+
+    /// Uses the Local Dictation input method (marked text).
+    var usesInputMethod: Bool { self != .keystrokes }
 }

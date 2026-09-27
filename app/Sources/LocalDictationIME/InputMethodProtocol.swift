@@ -62,15 +62,19 @@ public struct InputMethodReply: Codable, Sendable, Equatable {
     public var clientBundleID: String?
     public var marked: String?
     public var documentText: String?
+    /// The caret in AppKit screen coordinates (x, y, width, height), from the
+    /// client itself — reliable where Accessibility reports nothing.
+    public var caret: [Double]?
 
     public init(ok: Bool, error: String? = nil, attached: Bool, clientBundleID: String? = nil,
-                marked: String? = nil, documentText: String? = nil) {
+                marked: String? = nil, documentText: String? = nil, caret: [Double]? = nil) {
         self.ok = ok
         self.error = error
         self.attached = attached
         self.clientBundleID = clientBundleID
         self.marked = marked
         self.documentText = documentText
+        self.caret = caret
     }
 }
 

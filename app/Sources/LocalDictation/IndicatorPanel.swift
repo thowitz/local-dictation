@@ -7,12 +7,13 @@ import SwiftUI
 // matching the system dictation look: solid blue pill, white mic.
 //
 //   let panel = IndicatorPanel()
-//   panel.show(at: CaretLocator.caretAnchor())
+//   panel.show { CaretLocator.textAnchor() }
 //   panel.update(state: .listening)
 //   panel.update(state: .processing)
 //   panel.hide()
 //
-// While shown, the panel polls `CaretLocator` at ~10 Hz and repositions.
+// While shown, the panel polls its anchor at ~10 Hz and repositions; it
+// stays hidden while there is no caret to sit next to.
 // Polling stops on `hide()`. The panel never activates the app
 // (`.nonactivatingPanel`, `canBecomeKey`/`canBecomeMain` == false).
 
@@ -32,11 +33,13 @@ final class IndicatorPanel {
     private var model = IndicatorViewModel()
     private var pollTimer: Timer?
     private var isVisible = false
+    private var anchor: () -> CaretAnchor? = { nil }
 
     /// Panel is larger than the painted pill so soft shadow isn't clipped.
     /// Visual pill ≈ 34×28 — chubby stadium, tight around the mic.
     private let panelSize = CGSize(width: 48, height: 44)
-    private let caretGap: CGFloat = 8
+    /// The panel has ~8 pt of shadow margin around the pill.
+    private let caretGap: CGFloat = 0
 
     init() {
         panel = IndicatorNSPanel(
@@ -65,23 +68,24 @@ final class IndicatorPanel {
         panel.orderOut(nil)
     }
 
-    /// Shows the indicator at `anchor` and starts ~10 Hz caret polling.
-    func show(at anchor: CaretAnchor) {
+    /// Shows the indicator next to `anchor()` and follows it at ~10 Hz.
+    func show(following anchor: @escaping () -> CaretAnchor?) {
         model.state = .listening
         hostingView.rootView = IndicatorCapsuleView(model: model)
-        position(near: anchor)
-        panel.orderFrontRegardless()
+        self.anchor = anchor
         isVisible = true
+        pollCaret()
         startPolling()
+    }
+
+    func show(at anchor: CaretAnchor) {
+        show(following: { anchor })
     }
 
     /// Updates listening vs processing appearance.
     func update(state: IndicatorState) {
         model.state = state
         hostingView.rootView = IndicatorCapsuleView(model: model)
-        if isVisible {
-            panel.orderFrontRegardless()
-        }
     }
 
     /// Hides the panel and stops caret polling.
@@ -116,8 +120,11 @@ private extension IndicatorPanel {
 
     func pollCaret() {
         guard isVisible else { return }
-        let anchor = CaretLocator.caretAnchor()
+        // A caret that briefly stops reporting (text being inserted) keeps
+        // the pill where it was; it only stays hidden until the first caret.
+        guard let anchor = anchor() else { return }
         position(near: anchor)
+        panel.orderFrontRegardless()
     }
 
     func position(near anchor: CaretAnchor) {
@@ -125,15 +132,15 @@ private extension IndicatorPanel {
         let visible = screenVisibleFrame(containing: target)
         let size = panelSize
 
-        // Prefer just to the right of the caret; flip left if clipped.
-        var originX = target.maxX + caretGap
-        if originX + size.width > visible.maxX - 4 {
-            originX = target.minX - caretGap - size.width
-        }
+        // Centred just below the caret, like system dictation; above it if
+        // that would leave the screen.
+        var originX = target.midX - size.width / 2
         originX = min(max(originX, visible.minX + 4), visible.maxX - size.width - 4)
 
-        // Sit slightly below the caret midline (system dictation sits low).
-        var originY = target.midY - size.height * 0.65
+        var originY = target.minY - caretGap - size.height
+        if originY < visible.minY + 4 {
+            originY = target.maxY + caretGap
+        }
         originY = min(max(originY, visible.minY + 4), visible.maxY - size.height - 4)
 
         let frame = NSRect(origin: CGPoint(x: originX, y: originY), size: size)

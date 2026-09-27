@@ -190,7 +190,7 @@ final class Harness {
     ) async {
         let base = expectedBase.isEmpty ? "" : expectedBase + " "
         let started = Date()
-        let inserter = InputMethodInserter(attachTimeout: .seconds(4))
+        let inserter = InputMethodInserter(method: harnessMethod, attachTimeout: .seconds(4))
         var failures: [StepFailure] = []
         guard inserter.begin(terminal: target.terminalOutput != nil) else {
             failures.append(StepFailure(step: 0, expected: "", actual: nil, note: "begin failed: \(inserter.status)"))
@@ -329,7 +329,8 @@ func runController(_ harness: Harness, target: Target, wav: URL, config: AppConf
         isAccessibilityTrusted: { true },
         startAudio: { handler in feeder.start(handler) },
         stopAudio: { feeder.stop() },
-        presentsSessionUI: false
+        // --ui: show the app's own mic indicator, as the real app does.
+        presentsSessionUI: CommandLine.arguments.contains("--ui")
     )
     let controller = DictationController(config: config, dependencies: deps)
     var finalText: String?
@@ -352,7 +353,8 @@ func runController(_ harness: Harness, target: Target, wav: URL, config: AppConf
     if target.pageID != nil || target.terminalOutput != nil {
         actual = await harness.readBack(target, expecting: expected).text
     } else {
-        let probe = InputMethodInserter(attachTimeout: .seconds(4))
+        let probe = InputMethodInserter(method: harnessMethod == .keystrokes ? .switchPerDictation : harnessMethod,
+                                        attachTimeout: .seconds(4))
         _ = probe.begin()
         for _ in 0..<200 where probe.status == .attaching { try? await Task.sleep(for: .milliseconds(20)) }
         actual = await harness.readBack(target, expecting: expected).text
@@ -406,17 +408,22 @@ func arg(_ name: String) -> String? {
 }
 
 let out = URL(fileURLWithPath: arg("--out") ?? "/tmp/ld-ime", isDirectory: true)
+/// --method switch-per-dictation|always-selected
+let harnessMethod = arg("--method").flatMap(InsertionMethod.init(rawValue:)) ?? .switchPerDictation
 try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
 NSApplication.shared.setActivationPolicy(.accessory)
 
 Task { @MainActor in
     let harness = Harness(out: out)
     do { try harness.reporter.start() } catch { harness.log("page reporter failed: \(error)") }
-    harness.log("harness start; IME installed at \(InputMethodInstaller.installedURL.path)")
-    let registered = InputMethodInstaller.installAndRegister()
-    harness.log("input source registered: \(registered != nil) enabled: \(InputMethodInstaller.isEnabled())")
-    guard InputMethodInstaller.isEnabled() else {
-        harness.log("input source not enabled — approve it once in System Settings → Keyboard → Input Sources")
+    let installer = InputMethodInstaller()
+    harness.log("harness start; method=\(harnessMethod.rawValue) IME at \(installer.installedURL.path)")
+    InputMethodInstaller.allowDisabledForTesting = args.contains("--allow-disabled")
+    let registered = installer.inputSource()
+    let setup = installer.setUp()
+    harness.log("input source registered: \(registered != nil) setup: \(setup) enabled: \(installer.isEnabled())")
+    guard installer.isEnabled() || args.contains("--allow-disabled") else {
+        harness.log("input source not enabled")
         harness.save()
         exit(2)
     }
@@ -452,7 +459,7 @@ Task { @MainActor in
         } else {
             config = AppConfig(provider: .parakeet, parakeetModelPath: arg("--model"))
         }
-        config.useInputMethod = true
+        config.insertionMethod = harnessMethod
         for app in apps {
             for path in wavs.split(separator: ",") {
                 if let target = (try? harness.makeTargets([app]))?.first {

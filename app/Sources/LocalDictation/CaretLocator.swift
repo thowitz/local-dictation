@@ -71,6 +71,11 @@ struct CaretLocator: Sendable {
 
     /// Resolves the best available caret anchor.
     static func caretAnchor() -> CaretAnchor {
+        textAnchor() ?? mouseAnchor()
+    }
+
+    /// The caret or focused field, or nil (no mouse fallback).
+    static func textAnchor() -> CaretAnchor? {
         if let focused = focusedUIElement() {
             if let caret = caretBounds(of: focused),
                isPlausible(caret),
@@ -86,7 +91,7 @@ struct CaretLocator: Sendable {
                 return CaretAnchor(rect: field, level: .focusedField)
             }
         }
-        return mouseAnchor()
+        return nil
     }
 }
 

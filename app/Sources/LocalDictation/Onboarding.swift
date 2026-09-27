@@ -17,11 +17,26 @@ enum SetupStepID: String, CaseIterable, Equatable, Sendable {
     case accessibility
     case inputMonitoring
     case micKeyRemap
-    /// The Local Dictation input source (marked-text insertion). macOS
-    /// requires the user to approve a third-party input source once.
+    /// The Local Dictation input method (complete for keystrokes). The user
+    /// adds it in Input Sources once (the app does it itself only when it
+    /// has Full Disk Access).
     case inputMethod
     case dictationShortcut
     case siriHoldF5
+}
+
+/// What is left to do after the app tried to enable its input method.
+enum InputMethodSetupHint: Equatable, Sendable {
+    case done
+    /// Add it in Keyboard → Input Sources.
+    case addInputSource
+
+    init(_ result: InputMethodInstaller.EnableResult) {
+        switch result {
+        case .enabled, .enabledNow: self = .done
+        case .needsUser, .notInstalled: self = .addInputSource
+        }
+    }
 }
 
 enum SetupMicrophoneStatus: Equatable, Sendable {
@@ -143,7 +158,9 @@ struct SetupSnapshot: Equatable, Sendable {
             }
             return "\(mapping) · \(persistence)"
         case .inputMethod:
-            return inputMethodEnabled ? "Enabled" : "Not added — needs your approval once"
+            return inputMethodEnabled
+                ? "Enabled"
+                : "Not added — add Local Dictation in Input Sources once"
         case .dictationShortcut:
             switch firstRunReport.dictationShortcut {
             case .enabled: return dictationShortcutConfirmedOff ? "Confirmed off (probe still on)" : "Detected on"
@@ -172,9 +189,9 @@ enum SystemSettingsLinks {
     static let inputMonitoringURL = URL(
         string: "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ListenEvent"
     )!
+    static let keyboardURL = URL(string: "x-apple.systempreferences:com.apple.Keyboard-Settings.extension")!
     static var dictationURL: URL { FirstRunChecks.dictationSettingsURL }
     static var siriURL: URL { FirstRunChecks.siriSettingsURL }
-    static let keyboardURL = URL(string: "x-apple.systempreferences:com.apple.Keyboard-Settings.extension")!
 
     static let microphonePath = "Privacy & Security → Microphone"
     static let accessibilityPath = "Privacy & Security → Accessibility"
@@ -343,8 +360,9 @@ struct OnboardingDependencies {
     var removeRemap: () throws -> Void
     var removeLaunchAgent: () throws -> Void
     var inputMethodEnabled: () -> Bool = { true }
-    /// Install/register the input method and ask macOS to enable it.
-    var enableInputMethod: () -> Void = {}
+    /// Install, register and enable the input method; says what the user
+    /// still has to do.
+    var enableInputMethod: () -> InputMethodSetupHint = { .done }
 
     static func production(micKeyManager: MicKeyManager) -> OnboardingDependencies {
         OnboardingDependencies(
@@ -367,8 +385,13 @@ struct OnboardingDependencies {
             installLaunchAgent: { try micKeyManager.installLaunchAgent() },
             removeRemap: { try micKeyManager.removeRemap() },
             removeLaunchAgent: { try micKeyManager.removeLaunchAgent() },
-            inputMethodEnabled: { InputMethodInstaller.isEnabled() },
-            enableInputMethod: { InputMethodInstaller.requestEnable() }
+            inputMethodEnabled: {
+                !AppConfig.load().insertionMethod.usesInputMethod || InputMethodInstaller().isEnabled()
+            },
+            enableInputMethod: {
+                guard AppConfig.load().insertionMethod.usesInputMethod else { return .done }
+                return InputMethodSetupHint(InputMethodInstaller().setUp())
+            }
         )
     }
 }
@@ -482,8 +505,12 @@ final class OnboardingCoordinator: ObservableObject {
         case .micKeyRemap:
             await installRemapFromSetup()
         case .inputMethod:
-            deps.enableInputMethod()
-            openSettings(SystemSettingsLinks.keyboardURL, path: SystemSettingsLinks.inputMethodPath)
+            switch deps.enableInputMethod() {
+            case .done:
+                break
+            case .addInputSource:
+                openSettings(SystemSettingsLinks.keyboardURL, path: SystemSettingsLinks.inputMethodPath)
+            }
             refresh()
         case .dictationShortcut:
             openSettings(SystemSettingsLinks.dictationURL, path: SystemSettingsLinks.dictationPath)

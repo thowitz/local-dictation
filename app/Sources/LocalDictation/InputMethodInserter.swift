@@ -9,10 +9,14 @@ import os
 /// place, finalized text is committed. No synthetic keystrokes, so revisions
 /// of any length are safe and nothing can be duplicated or overwritten.
 ///
-/// Per session: select the input method (remembering the user's source),
-/// wait for it to attach to the focused field, stream updates, then restore
-/// the previous source. If it never attaches, `onUnavailable` fires and the
-/// caller falls back to keystroke typing.
+/// Per session, by `InsertionMethod`:
+/// - `.switchPerDictation`: select the input method, restore the user's
+///   source afterwards (hiding the caret badge around both switches).
+/// - `.alwaysSelected`: the input method stays selected; nothing switches
+///   (it is re-selected if the user moved away).
+///
+/// Then wait for it to attach to the focused field and stream updates. If it
+/// never attaches, `onUnavailable` fires and the caller falls back to keystrokes.
 @MainActor
 final class InputMethodInserter {
     enum Status: Equatable {
@@ -22,6 +26,8 @@ final class InputMethodInserter {
         case failed(String)
     }
 
+    let method: InsertionMethod
+    let installer = InputMethodInstaller()
     private(set) var status: Status = .idle
     /// The input method attached this session (text may be on screen).
     private(set) var didAttach = false
@@ -33,9 +39,11 @@ final class InputMethodInserter {
     /// Called once per session if the input method cannot be used.
     var onUnavailable: ((String) -> Void)?
 
+    private let badge: InputSourceBadge?
     private var previousSource: TISInputSource?
-    /// A delayed restore from the previous session, cancelled if a new one starts.
-    private var pendingRestore: (task: Task<Void, Never>, source: TISInputSource)?
+    /// The previous session's delayed end (restore the keyboard source);
+    /// cancelled if a new session starts first.
+    private var pendingEnd: (task: Task<Void, Never>, action: @MainActor () -> Void, restores: TISInputSource?)?
     private var session = ""
     private var pending: InputMethodRequest?
     private var attachTask: Task<Void, Never>?
@@ -44,26 +52,33 @@ final class InputMethodInserter {
     private var terminal = false
     private let attachTimeout: Duration
 
-    init(attachTimeout: Duration = .seconds(1.5)) {
+    init(method: InsertionMethod, hideBadge: Bool = true, attachTimeout: Duration = .seconds(1.5)) {
+        precondition(method.usesInputMethod, "keystrokes need no input method")
+        self.method = method
+        badge = hideBadge ? .shared : nil
         self.attachTimeout = attachTimeout
     }
 
-    /// Switch to the input method for this session. Returns false when it is
-    /// not installed or cannot be selected (use keystrokes instead).
+    /// Start using the input method for this session. Returns false when it
+    /// is not installed or cannot be selected (use keystrokes instead).
     func begin(terminal: Bool = false) -> Bool {
         end(restoreDelay: .zero)
         self.terminal = terminal
-        // Only an input source the user already approved: enabling one
-        // triggers macOS's approval UI, which belongs in the Setup Checklist.
-        guard let source = InputMethodInstaller.enabledSource() else {
+        guard let source = installer.enabledSource() else {
             status = .failed("input method not enabled")
             return false
         }
-        previousSource = Self.sourceToRestore(pending: pendingRestore?.source)
-        pendingRestore?.task.cancel()
-        pendingRestore = nil
-        guard TISSelectInputSource(source) == noErr else {
-            status = .failed("could not select input method")
+        switch method {
+        case .switchPerDictation:
+            previousSource = Self.sourceToRestore(pending: pendingEnd?.restores)
+            pendingEnd?.task.cancel()
+            pendingEnd = nil
+            guard select(source) else { return false }
+        case .alwaysSelected:
+            pendingEnd?.task.cancel()
+            pendingEnd = nil
+            guard select(source) else { return false }
+        case .keystrokes:
             return false
         }
         session = UUID().uuidString
@@ -97,7 +112,19 @@ final class InputMethodInserter {
         end(restoreDelay: .milliseconds(150))
     }
 
-    /// Stop the session and put the user's input source back.
+    /// Where the caret is in the attached field (AppKit screen coordinates).
+    func caretRect() -> CGRect? {
+        guard status == .attached,
+              let reply = InputMethodPortClient.send(
+                  InputMethodRequest(op: .probe, session: session), timeout: 0.1
+              ),
+              reply.attached, let c = reply.caret, c.count == 4
+        else { return nil }
+        return CGRect(x: c[0], y: c[1], width: c[2], height: c[3])
+    }
+
+    /// Stop the session: restore the user's keyboard source after a
+    /// per-dictation switch.
     func end(restoreDelay: Duration) {
         attachTask?.cancel()
         attachTask = nil
@@ -105,28 +132,67 @@ final class InputMethodInserter {
         if status != .idle {
             status = .idle
         }
-        guard let previous = previousSource else { return }
+        let action: @MainActor () -> Void
+        var restores: TISInputSource?
+        if let previous = previousSource {
+            let badge = badge
+            action = {
+                badge?.suppress()
+                TISSelectInputSource(previous)
+                badge?.restore(after: InputSourceBadge.settleTime)
+            }
+            restores = previous
+        } else {
+            badge?.restore(after: InputSourceBadge.settleTime)
+            selectedSource = nil
+            return
+        }
+        selectedSource = nil
         previousSource = nil
         if restoreDelay == .zero {
-            TISSelectInputSource(previous)
+            action()
         } else {
             // Let the client process the last insert before the IME detaches.
             let task = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: restoreDelay)
                 guard !Task.isCancelled else { return }
-                TISSelectInputSource(previous)
-                self?.pendingRestore = nil
+                action()
+                self?.pendingEnd = nil
             }
-            pendingRestore = (task, previous)
+            pendingEnd = (task, action, restores)
         }
     }
 
-    /// Apply a pending delayed restore right away (app quitting).
+    /// Apply a pending delayed end right away (app quitting).
     func restoreNow() {
-        guard let pending = pendingRestore else { return }
-        pending.task.cancel()
-        pendingRestore = nil
-        TISSelectInputSource(pending.source)
+        if let pending = pendingEnd {
+            pending.task.cancel()
+            pendingEnd = nil
+            pending.action()
+        }
+        badge?.restoreNow()
+    }
+
+    /// Leave the method (menu change): put the user's layout back if we kept
+    /// the keyboard input method selected.
+    func deactivate() {
+        restoreNow()
+        guard method == .alwaysSelected,
+              let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+              InputMethodInstaller.sourceID(current) == InputMethodIdentity.inputSourceID,
+              let layout = TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue()
+        else { return }
+        badge?.suppress()
+        TISSelectInputSource(layout)
+        badge?.restore(after: InputSourceBadge.settleTime)
+    }
+
+    /// Enter the method (launch / menu change): keep the keyboard input
+    /// method selected from now on.
+    func activate() {
+        guard method == .alwaysSelected, let source = installer.enabledSource() else { return }
+        _ = select(source)
+        badge?.restore(after: InputSourceBadge.settleTime)
     }
 
     /// What to switch back to after the session: the user's current source,
@@ -143,6 +209,24 @@ final class InputMethodInserter {
     }
 
     // MARK: - Internals
+
+    /// Select the keyboard input method unless it already is. macOS draws a
+    /// generic glyph as our badge whatever icon or label the bundle declares
+    /// (tested on macOS 27), so it is hidden too; the caret mic is our own.
+    private func select(_ source: TISInputSource) -> Bool {
+        if let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+           InputMethodInstaller.sourceID(current) == InputMethodIdentity.inputSourceID
+        {
+            return true
+        }
+        badge?.suppress()
+        guard TISSelectInputSource(source) == noErr else {
+            badge?.restoreNow()
+            status = .failed("could not select input method")
+            return false
+        }
+        return true
+    }
 
     @discardableResult
     private func send(_ request: InputMethodRequest) -> Bool {
@@ -174,15 +258,15 @@ final class InputMethodInserter {
     private func waitForAttach() async {
         let clock = ContinuousClock()
         let deadline = clock.now + attachTimeout
-        var nextReselect = clock.now + .milliseconds(300)
+        // Clients apply source changes asynchronously: an end from the previous
+        // session can land after our selection and leave the input method
+        // detached. Re-select once, late enough not to fight a normal attach.
+        var reselectAt: ContinuousClock.Instant? = clock.now + .milliseconds(700)
         while !Task.isCancelled, clock.now < deadline {
             if tryBegin() { return }
-            if clock.now >= nextReselect {
-                // Clients apply source changes asynchronously: a restore from
-                // the previous session can land after our selection and leave
-                // the input method selected but detached. Switch away and back.
+            if let at = reselectAt, clock.now >= at {
                 reselect()
-                nextReselect = clock.now + .milliseconds(400)
+                reselectAt = nil
             }
             try? await Task.sleep(for: .milliseconds(30))
         }
@@ -191,12 +275,16 @@ final class InputMethodInserter {
     }
 
     private func reselect() {
-        guard let ours = selectedSource,
-              let away = previousSource ?? TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue()
-        else { return }
+        guard let ours = selectedSource else { return }
         AppLog.insertion.info("input method not attached yet; re-selecting")
+        guard let away = previousSource ?? TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue()
+        else { return }
+        badge?.suppress()
         TISSelectInputSource(away)
         TISSelectInputSource(ours)
+        if method == .alwaysSelected {
+            badge?.restore(after: InputSourceBadge.settleTime)
+        }
     }
 
     /// Synchronous variant used when the session ends while still attaching.
@@ -216,6 +304,7 @@ final class InputMethodInserter {
         ), reply.ok, reply.attached else { return false }
         status = .attached
         didAttach = true
+        lastReply = reply
         AppLog.insertion.info(
             "input method attached to \(reply.clientBundleID ?? "?", privacy: .public)"
         )
@@ -235,23 +324,105 @@ final class InputMethodInserter {
     }
 }
 
+/// macOS's input-source badge beside the caret (Sonoma+), which appears on
+/// every source change: "A" for a keyboard layout, the input method's icon
+/// for ours. `TSMLanguageIndicatorEnabled` = false turns it off for all apps
+/// and running apps honour the change at once, so it is turned off just for
+/// the switches and restored once they have settled.
+@MainActor
+final class InputSourceBadge {
+    static let shared = InputSourceBadge()
+    /// How long after a switch the badge stays off (the client shows it
+    /// asynchronously once it processes the change).
+    static let settleTime: Duration = .seconds(3)
+
+    private static let key = "TSMLanguageIndicatorEnabled" as CFString
+    /// Set while we have the badge off, so a crash can be undone at launch.
+    private static let markerKey = "inputSourceBadgeSuppressed"
+    private var suppressed = false
+    private var restoreTask: Task<Void, Never>?
+
+    func suppress() {
+        restoreTask?.cancel()
+        restoreTask = nil
+        guard !suppressed else { return }
+        // The user turned the badge off themselves: leave their setting alone.
+        if Self.userValue() == false { return }
+        Self.write(false)
+        suppressed = true
+        AppIdentity.defaults.set(true, forKey: Self.markerKey)
+    }
+
+    func restore(after delay: Duration) {
+        guard suppressed else { return }
+        restoreTask?.cancel()
+        restoreTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            self?.restoreNow()
+        }
+    }
+
+    func restoreNow() {
+        restoreTask?.cancel()
+        restoreTask = nil
+        guard suppressed else { return }
+        Self.write(nil)
+        suppressed = false
+        AppIdentity.defaults.removeObject(forKey: Self.markerKey)
+    }
+
+    /// Undo a suppression left behind by a crash or force-quit.
+    static func recoverAfterCrash() {
+        guard AppIdentity.defaults.bool(forKey: markerKey) else { return }
+        write(nil)
+        AppIdentity.defaults.removeObject(forKey: markerKey)
+    }
+
+    private static func userValue() -> Bool? {
+        CFPreferencesCopyValue(key, kCFPreferencesAnyApplication, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+            as? Bool
+    }
+
+    /// nil removes the key (macOS default: badge on).
+    private static func write(_ value: Bool?) {
+        CFPreferencesSetValue(
+            key, value.map { $0 as CFBoolean }, kCFPreferencesAnyApplication,
+            kCFPreferencesCurrentUser, kCFPreferencesAnyHost
+        )
+        CFPreferencesSynchronize(kCFPreferencesAnyApplication, kCFPreferencesCurrentUser, kCFPreferencesAnyHost)
+    }
+}
+
 /// Installs the bundled input method into `~/Library/Input Methods` and
 /// registers it with the Text Input Sources service.
-enum InputMethodInstaller {
-    static var installedURL: URL {
+struct InputMethodInstaller: Sendable {
+    enum EnableResult: Equatable {
+        case enabled
+        /// Newly enabled: processes started earlier (this one included) keep
+        /// seeing the source as disabled.
+        case enabledNow
+        /// The user adds it in Keyboard → Input Sources (writing the
+        /// enabled-sources list ourselves needs Full Disk Access).
+        case needsUser
+        case notInstalled
+    }
+
+    var installedURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Input Methods", isDirectory: true)
             .appendingPathComponent(InputMethodIdentity.bundleName, isDirectory: true)
     }
 
-    /// The copy shipped inside the app (or `LOCAL_DICTATION_IME_BUNDLE` in development).
-    static var embeddedURL: URL? {
-        if let override = ProcessInfo.processInfo.environment["LOCAL_DICTATION_IME_BUNDLE"] {
-            return URL(fileURLWithPath: override, isDirectory: true)
+    /// The copy shipped inside the app (or `LOCAL_DICTATION_IME_DIR` in development).
+    var embeddedURL: URL? {
+        let base: URL
+        if let override = ProcessInfo.processInfo.environment["LOCAL_DICTATION_IME_DIR"] {
+            base = URL(fileURLWithPath: override, isDirectory: true)
+        } else {
+            base = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers", isDirectory: true)
         }
-        let url = Bundle.main.bundleURL
-            .appendingPathComponent("Contents/Helpers", isDirectory: true)
-            .appendingPathComponent(InputMethodIdentity.bundleName, isDirectory: true)
+        let url = base.appendingPathComponent(InputMethodIdentity.bundleName, isDirectory: true)
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
@@ -260,46 +431,102 @@ enum InputMethodInstaller {
         return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
     }
 
+    /// Diagnostics: treat a registered-but-disabled source as usable.
+    nonisolated(unsafe) static var allowDisabledForTesting = false
+    /// `enable()` turned it on in this process (whose TIS view stays stale).
+    nonisolated(unsafe) private static var enabledThisRun = false
+
     /// Our source if registered (enabled or not).
-    static func inputSource() -> TISInputSource? {
+    func inputSource() -> TISInputSource? {
         source(includeDisabled: true)
     }
 
-    /// Our source only if the user has enabled it.
-    static func enabledSource() -> TISInputSource? {
-        source(includeDisabled: false)
+    /// Our source only if it is enabled.
+    func enabledSource() -> TISInputSource? {
+        source(includeDisabled: Self.allowDisabledForTesting || Self.enabledThisRun)
     }
 
-    private static func source(includeDisabled: Bool) -> TISInputSource? {
+    private func source(includeDisabled: Bool) -> TISInputSource? {
+        // List everything installed and read the enabled property.
         let filter = [kTISPropertyInputSourceID as String: InputMethodIdentity.inputSourceID] as CFDictionary
-        let list = TISCreateInputSourceList(filter, includeDisabled)?.takeRetainedValue() as? [TISInputSource]
-        return list?.first
+        guard let source = (TISCreateInputSourceList(filter, true)?.takeRetainedValue() as? [TISInputSource])?.first
+        else { return nil }
+        if includeDisabled { return source }
+        guard let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsEnabled) else { return nil }
+        return CFBooleanGetValue(Unmanaged<CFBoolean>.fromOpaque(raw).takeUnretainedValue()) ? source : nil
     }
 
-    /// Registered and enabled (the user approved it in System Settings).
-    static func isEnabled() -> Bool {
+    /// Registered and enabled.
+    func isEnabled() -> Bool {
         enabledSource() != nil
     }
 
-    /// Install + register, then ask macOS to enable it (it shows its own
-    /// approval UI for third-party input sources).
-    static func requestEnable() {
-        guard let source = installAndRegister() else { return }
-        TISEnableInputSource(source)
+    /// Install, register and try to enable, then start the input method.
+    @MainActor
+    @discardableResult
+    func setUp() -> EnableResult {
+        installAndRegister()
+        let result = enable()
+        prelaunch(restart: result == .enabledNow)
+        return result
+    }
+
+    /// Enable the source the way macOS records it. `TISEnableInputSource`
+    /// returns noErr for a third-party input method without enabling it, so
+    /// write the enabled-sources entries directly. `com.apple.inputsources`
+    /// is only writable with Full Disk Access; without it the user adds the
+    /// input method in Keyboard → Input Sources once.
+    @discardableResult
+    func enable() -> EnableResult {
+        guard inputSource() != nil else { return .notInstalled }
+        if isEnabled() { return .enabled }
+        let entry = [
+            "Bundle ID": InputMethodIdentity.bundleIdentifier,
+            "InputSourceKind": "Keyboard Input Method",
+        ]
+        let lists = [
+            ("com.apple.inputsources", "AppleEnabledThirdPartyInputSources"),
+            ("com.apple.HIToolbox", "AppleEnabledInputSources"),
+        ]
+        for (domain, key) in lists {
+            var list = CFPreferencesCopyAppValue(key as CFString, domain as CFString) as? [[String: Any]] ?? []
+            list.removeAll { $0["Bundle ID"] as? String == InputMethodIdentity.bundleIdentifier }
+            list.append(entry)
+            CFPreferencesSetAppValue(key as CFString, list as CFArray, domain as CFString)
+            guard CFPreferencesAppSynchronize(domain as CFString) else {
+                AppLog.insertion.info("could not write \(domain, privacy: .public) (needs Full Disk Access)")
+                return .needsUser
+            }
+        }
+        Self.enabledThisRun = true
+        AppLog.insertion.info("enabled input method \(InputMethodIdentity.bundleIdentifier, privacy: .public)")
+        return .enabledNow
+    }
+
+    /// Start the input method's process (a no-op if it is running).
+    func launch() {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = false
+        configuration.addsToRecentItems = false
+        NSWorkspace.shared.openApplication(at: installedURL, configuration: configuration) { _, error in
+            if let error {
+                AppLog.insertion.error("input method launch failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
     }
 
     /// Copy the embedded bundle if it is missing or different, then register.
     @discardableResult
-    static func installAndRegister() -> TISInputSource? {
+    func installAndRegister() -> TISInputSource? {
         let fm = FileManager.default
         let target = installedURL
-        if let embedded = embeddedURL, !bundlesMatch(embedded, target) {
+        if let embedded = embeddedURL, !Self.bundlesMatch(embedded, target) {
             do {
                 try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
                 if fm.fileExists(atPath: target.path) { try fm.removeItem(at: target) }
                 try fm.copyItem(at: embedded, to: target)
                 // A running old copy keeps serving until it exits.
-                terminateRunningInputMethod()
+                terminateRunning()
                 AppLog.insertion.info("installed input method at \(target.path, privacy: .public)")
             } catch {
                 AppLog.insertion.error("input method install failed: \(error.localizedDescription, privacy: .public)")
@@ -315,35 +542,37 @@ enum InputMethodInstaller {
     }
 
     static func bundlesMatch(_ a: URL, _ b: URL) -> Bool {
-        let exe = "Contents/MacOS/LocalDictationInput"
-        guard let da = FileManager.default.contents(atPath: a.appendingPathComponent(exe).path),
-              let db = FileManager.default.contents(atPath: b.appendingPathComponent(exe).path)
-        else { return false }
-        return da == db
-    }
-
-    /// Start the input method's process ahead of the first dictation. The
-    /// first launch after an install or update takes seconds (the system
-    /// assesses the new binary) — longer than a dictation should wait before
-    /// falling back to keystrokes. A background-only input method cannot be
-    /// opened directly, so select it briefly: macOS launches it, and it keeps
-    /// running after the previous source is restored.
-    @MainActor
-    static func prelaunchIfEnabled() {
-        guard let source = enabledSource(),
-              NSRunningApplication.runningApplications(withBundleIdentifier: InputMethodIdentity.bundleIdentifier).isEmpty,
-              let previous = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
-              sourceID(previous) != InputMethodIdentity.inputSourceID
-        else { return }
-        guard TISSelectInputSource(source) == noErr else { return }
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(300))
-            TISSelectInputSource(previous)
-            AppLog.insertion.info("input method warmed up")
+        let files = ["Contents/MacOS/LocalDictationInput", "Contents/Info.plist"]
+        return files.allSatisfy { file in
+            guard let da = FileManager.default.contents(atPath: a.appendingPathComponent(file).path),
+                  let db = FileManager.default.contents(atPath: b.appendingPathComponent(file).path)
+            else { return false }
+            return da == db
         }
     }
 
-    private static func terminateRunningInputMethod() {
+    /// Start the input method's process ahead of the first dictation, without
+    /// selecting anything (no badge). The first launch after an install or
+    /// update takes seconds (the system assesses the new binary) — longer than
+    /// a dictation should wait before falling back to keystrokes. `restart`
+    /// replaces a running copy whose view of the enabled sources is stale.
+    @MainActor
+    func prelaunch(restart: Bool = false) {
+        guard isEnabled() else { return }
+        let running = { NSRunningApplication.runningApplications(withBundleIdentifier: InputMethodIdentity.bundleIdentifier) }
+        guard restart || running().isEmpty else { return }
+        Task { @MainActor in
+            if restart {
+                terminateRunning()
+                for _ in 0..<40 where !running().isEmpty {
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+            }
+            launch()
+        }
+    }
+
+    private func terminateRunning() {
         for app in NSRunningApplication.runningApplications(withBundleIdentifier: InputMethodIdentity.bundleIdentifier) {
             app.terminate()
         }

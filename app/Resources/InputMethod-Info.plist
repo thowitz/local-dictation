@@ -17,13 +17,15 @@
 	<key>CFBundleShortVersionString</key>
 	<string>0.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>5</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>15.0</string>
 	<key>LSBackgroundOnly</key>
 	<true/>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<!-- Keyboard-type input method: selected while dictating (or kept
+	     selected); it passes every key through with the user's layout. -->
 	<key>InputMethodConnectionName</key>
 	<string>com.omcdowell.inputmethod.LocalDictation_Connection</string>
 	<key>InputMethodServerControllerClass</key>
@@ -42,5 +44,15 @@
 	<string>MenuIcon.tiff</string>
 	<key>TISIconIsTemplate</key>
 	<true/>
+	<!-- Apple's DictationIM declares its input-source icon with this system
+	     microphone glyph; MenuIcon.tiff is the fallback. -->
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>ISGraphicIconConfiguration</key>
+		<dict>
+			<key>ISTypeIdentifier</key>
+			<string>com.apple.graphic-icon.microphone</string>
+		</dict>
+	</dict>
 </dict>
 </plist>
